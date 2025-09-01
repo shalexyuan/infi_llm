@@ -1,4 +1,4 @@
-# MCoCoNav
+# InfI-llm
 ## 📝 TODO List
 
  - [ ] Release demo video
