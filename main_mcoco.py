@@ -1,3 +1,7 @@
+import warnings
+# Suppress PyTorch grid_sample/affine_grid warnings
+warnings.filterwarnings("ignore", message="Default grid_sample and affine_grid behavior has changed")
+
 from collections import deque, defaultdict
 from typing import Dict
 from itertools import count
@@ -26,9 +30,9 @@ from PIL import Image
 
 import math
 import cv2
-import habitat # type: ignore
+import habitat
 import habitat_sim
-from habitat.sims.habitat_simulator.actions import ( # type: ignore
+from habitat.sims.habitat_simulator.actions import (
     HabitatSimActions,
     HabitatSimV1ActionSpaceConfiguration,
 )
@@ -58,11 +62,6 @@ import utils.pose as pu
 import utils.visualization as vu
 
 from arguments import get_args
-
-# AIDE imports
-from aide.integration import AIDEController
-from aide.config import AIDEConfig
-from aide.dual import PriceServer
 
 # from detect_yolov9 import Detect
 from detect.ultralytics import YOLOv10
@@ -762,6 +761,8 @@ def main():
     # Initialise habitat
     HabitatSimActions.extend_action_space("TURN_LEFT_S")
     HabitatSimActions.extend_action_space("TURN_RIGHT_S")
+    print("+"*10)
+    print(args.task_config)
 
     config_env = habitat.get_config(config_paths=["envs/habitat/configs/"
                                          + args.task_config])
@@ -804,9 +805,8 @@ def main():
         # yolo = Detect(imgsz=(args.env_frame_height, args.env_frame_width), device=device)
         pass
     else:
-        print("args.yolo_weights: ", args.yolo_weights)
         yolo = YOLOv10.from_pretrained(args.yolo_weights)
-    # print(config_env)
+    print(config_env)
     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
 
     
@@ -824,23 +824,6 @@ def main():
         agent.append(LLM_Agent(args, config_env, i, device))
         if 'objectnav_hm3d' in args.task_config:
             agent_GT.append(LLM_Agent_GT(args, config_env, i, device))
-
-    # ------------------------------------------------------------------
-    ##### AIDE Initialization
-    # ------------------------------------------------------------------
-    aide = None
-    price_server = None
-    if args.aide:
-        aide_cfg = AIDEConfig(
-            mem_bytes_robot=args.aide_mem_bytes,
-            comm_bytes_global=args.aide_comm_bytes,
-            epsilon_interf=args.aide_epsilon,
-            alpha_base=args.aide_alpha,
-            lambda_base=args.aide_lambda,
-            topk_candidates=args.aide_topk_cands
-        )
-        price_server = PriceServer(aide_cfg)      # p, τ 在此维护（或gossip）
-        aide = AIDEController(cogvlm2, aide_cfg, price_server)
 
     # ------------------------------------------------------------------
     ##### Setup Logging
@@ -1050,260 +1033,261 @@ def main():
 
                         
                         # ------------------------------------------------------------------
-                        #### VLM Planning (Original or AIDE)
+                        #### Perception VLM
                         # ------------------------------------------------------------------
-                        if args.aide:
-                            # AIDE: Grouping-Scoring-Selection-KV Loading-Message Summary
-                            agent_state = {
-                                'agent_id': j,
-                                'map_state': sem_map,  # Use sem_map as map_state
-                                'frontier_nodes': agent_TargetPointMap[j],  # Use agent_TargetPointMap as frontier_nodes
-                                'history_nodes': history_nodes,
-                                'pose': {'x': start[0], 'y': start[1], 'theta': start_o},  # Convert to pose format
-                                'last_goal': pre_goal_points[j] if len(pre_goal_points) > 0 else None,
-                                'top_candidates': agent_TargetPointMap[j] + history_nodes[:3],  # Combine frontier and history
-                                'node_from_choice': lambda choice: agent_TargetPointMap[j][choice] if choice < len(agent_TargetPointMap[j]) else (history_nodes[choice - len(agent_TargetPointMap[j])] if choice - len(agent_TargetPointMap[j]) < len(history_nodes) else [0, 0]),
-                                'groups': [],
-                                'group_directory': {},
-                                'global_graph': None,
-                                'group_index': {'counter': 0}
-                            }
-                            
-                            summaries, goal = aide.step(agent_state, goal_name)  # AIDE 选择 + 受限提示
-                            # TODO: net.broadcast(summaries)  # 只发摘要（哈希/标量）
-                            
-                            if goal is not None:
-                                # Convert goal to expected format [x, y]
-                                if isinstance(goal, dict):
-                                    goal_points[j] = [goal.get('x', 0), goal.get('y', 0)]
-                                elif isinstance(goal, list) and len(goal) >= 2:
-                                    goal_points[j] = goal[:2]
-                                else:
-                                    goal_points[j] = [0, 0]
-                            else:
-                                # Fallback to random goal if AIDE doesn't return one
-                                if len(agent_TargetPointMap[j]) > 0:
-                                    goal_points[j] = [int(x) for x in full_Frontiers_dict['frontier_0'].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                else:
-                                    actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
-                                    goal_points[j] = [int(actions[0]), int(actions[1])]
-                        else:
-                            # Original VLM planning pipeline
-                            Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
-                            _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
-                                                                            return_string_probabilities=None, img=rgb)
-                            Perception_Rel, Perception_Pred = cogvlm2.CoT2(User_Prompt1=Caption_Prompt, 
-                                                                           User_Prompt2=VLM_Perception_Prompt,
-                                                                           cot_pred1=Scene_Information,
-                                                                           return_string_probabilities="[Yes, No]", img=rgb)
-                            Perception_Rel = np.array(Perception_Rel)
-                            Perception_PR = Perception_weight_decision(Perception_Rel, Perception_Pred)
-                            logging.info(f"Agent_{j}--VLM_PerceptionPR: {Perception_PR}")
+                        Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
+                        # print("+"*10)
+                        # print(Caption_Prompt)
+                        # print("+"*10)
+                        
+                        # Time the first LLM call (Scene Information)
+                        start_time = time.time()
+                        _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
+                                                                        return_string_probabilities=None, img=rgb)
+                        scene_info_time = time.time() - start_time
+                        logging.info(f"Agent_{j}--LLM_Scene_Info_Time: {scene_info_time:.3f}s")
+                        
+                        # Time the second LLM call (Perception)
+                        start_time = time.time()
+                        Perception_Rel, Perception_Pred = cogvlm2.CoT2(User_Prompt1=Caption_Prompt, 
+                                                                       User_Prompt2=VLM_Perception_Prompt,
+                                                                       cot_pred1=Scene_Information,
+                                                                       return_string_probabilities="[Yes, No]", img=rgb)
+                        perception_time = time.time() - start_time
+                        logging.info(f"Agent_{j}--LLM_Perception_Time: {perception_time:.3f}s")
+                        Perception_Rel = np.array(Perception_Rel)
+                        Perception_PR = Perception_weight_decision(Perception_Rel, Perception_Pred)
+                        logging.info(f"Agent_{j}--VLM_PerceptionPR: {Perception_PR}")
+                        # agents_VLM_Rel[f"Agent_{i}--VLM_PerceptionRel"] = Perception_Rel
+                        # agents_VLM_Pred[f"Agent_{i}--VLM_PerceptionPred"] = Perception_Pred
+                        # agents_VLM_PR[f"Agent_{i}--VLM_PerceptionPR"] = Perception_PR
 
-                            is_exist_oldhistory = False
-                            if len(history_nodes) > 0:
-                                closest_index = -1
-                                min_distance = float('inf')
-                                new_x, new_y = start
-                                for i, (x, y) in enumerate(history_nodes):
-                                    distance = math.sqrt((x - new_x) * (x - new_x) + (y - new_y) * (y - new_y))
-                                    if distance < 25 and distance < min_distance:
-                                        min_distance = distance
-                                        closest_index = i
-                                        is_exist_oldhistory = True
+                        
 
-                                if  is_exist_oldhistory == False:
-                                    history_nodes.append(start)
-                                    history_count.append(1)
-                                    history_state = np.zeros(360)
-                                else:
-                                    history_count[closest_index] = history_count[closest_index] + 1
+                        is_exist_oldhistory = False
+                        if len(history_nodes) > 0:
+                            closest_index = -1
+                            min_distance = float('inf')
+                            new_x, new_y = start
+                            for i, (x, y) in enumerate(history_nodes):
+                                distance = math.sqrt((x - new_x) * (x - new_x) + (y - new_y) * (y - new_y))
+                                if distance < 25 and distance < min_distance:
+                                    min_distance = distance
+                                    closest_index = i
+                                    is_exist_oldhistory = True
 
-                                
-                            else:
+                            if  is_exist_oldhistory == False:
                                 history_nodes.append(start)
                                 history_count.append(1)
                                 history_state = np.zeros(360)
+                            else:
+                                history_count[closest_index] = history_count[closest_index] + 1
 
                             
-                            cur_goal_points.append(start)
+                        else:
+                            history_nodes.append(start)
+                            history_count.append(1)
+                            history_state = np.zeros(360)
 
-                            if len(agent_TargetPointMap[j]) > 0:
-                                
-                                logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
+                        
+                        cur_goal_points.append(start)
 
-                                # ------------------------------------------------------------------
-                                #### Judgment VLM
-                                # ------------------------------------------------------------------
-                                if len(history_nodes) > 0:
-                                    if len(pre_goal_points) > 0:
-                                        FN_Prompt = form_prompt_for_FN(goal_name, agents_seg_list, Perception_PR, pre_goal_points[j], full_Frontiers_dict, start, history_nodes)
-                                    else:
-                                        FN_Prompt = form_prompt_for_FN(goal_name, agents_seg_list, Perception_PR, pre_goal_points, full_Frontiers_dict, start, history_nodes)
-                                    # logging.info(FN_Prompt)
-                                    
-                                    FN_Rel, FN_Decision = cogvlm2.simple_image_chat(User_Prompt=FN_Prompt, 
-                                                                                            return_string_probabilities="[Yes, No]", img=sem_map)
+                        if len(agent_TargetPointMap[j]) > 0:
+                            
+                            logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
 
-                                    FN_PR = Perception_weight_decision(FN_Rel, FN_Decision)
-                                    logging.info(f"Agent_{j}--FN_PR: {FN_PR}")
-                                    if FN_PR == 'Neither':
-                                        FN_PR = FN_Rel
-
-                                    
-                                    
-                                    angle_score = Perception_PR[0] * 2 + FN_PR[0]
-                                    agent[j].angle_score = angle_score
-                                    c_angle = int(start_o % 360)
-
-                                    if is_exist_oldhistory == False:
-                                        if c_angle >= 39 and c_angle < 321:
-                                            history_state[c_angle-39:c_angle+39] = angle_score
-                                        elif c_angle < 39:
-                                            history_state[:c_angle+39] = angle_score
-                                            history_state[360-c_angle-39:] = angle_score
-
-                                        elif c_angle >= 321:
-                                            history_state[c_angle-39:] = angle_score
-                                            history_state[:c_angle+39-360] = angle_score
-                                        h_score = history_state.sum()
-                                        history_states.append(history_state)
-                                        history_score.append(h_score)
-                                    else:
-                                        if c_angle >= 39 and c_angle < 321:
-                                            history_states[closest_index][c_angle-39:c_angle+39] = angle_score
-                                        elif c_angle < 39:
-                                            history_states[closest_index][:c_angle] = angle_score
-                                            history_states[closest_index][360-c_angle:] = angle_score
-                                        elif c_angle >= 321:
-                                            history_states[closest_index][c_angle:] = angle_score
-                                            history_states[closest_index][:360-c_angle] = angle_score
-                                        h_score = history_states[closest_index].sum() / history_count[closest_index]
-                                        history_score[closest_index] = h_score
-
-                                logging.info(f'=====> history_nodes: {history_nodes}')
-                                logging.info(f'=====> history_score: {history_score}')
-                                # Scores = []
-                                if j == 0:
-                                    history_nodes_copy = history_nodes.copy()
-                                    history_score_copy = history_score.copy()
-                                    full_Frontiers_dict_copy = full_Frontiers_dict.copy()
+                            # ------------------------------------------------------------------
+                            #### Judgment VLM
+                            # ------------------------------------------------------------------
+                            if len(history_nodes) > 0:
+                                if len(pre_goal_points) > 0:
+                                    FN_Prompt = form_prompt_for_FN(goal_name, agents_seg_list, Perception_PR, pre_goal_points[j], full_Frontiers_dict, start, history_nodes)
                                 else:
-                                    missing_key_F = []
-                                    if len(full_Frontiers_dict) == 4:
-                                        frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
-                                    elif len(full_Frontiers_dict) == 3:
-                                        frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2']
-                                    elif len(full_Frontiers_dict) == 2:
-                                        frontier_keys = ['frontier_0', 'frontier_1']
-                                    else:
-                                        frontier_keys = ['frontier_0']
+                                    FN_Prompt = form_prompt_for_FN(goal_name, agents_seg_list, Perception_PR, pre_goal_points, full_Frontiers_dict, start, history_nodes)
+                                # logging.info(FN_Prompt)
+                                
+                                # Time the Judgment VLM call
+                                start_time = time.time()
+                                FN_Rel, FN_Decision = cogvlm2.simple_image_chat(User_Prompt=FN_Prompt, 
+                                                                                        return_string_probabilities="[Yes, No]", img=sem_map)
+                                judgment_time = time.time() - start_time
+                                logging.info(f"Agent_{j}--LLM_Judgment_Time: {judgment_time:.3f}s")
+                                
+                                # Calculate total LLM time so far for this agent
+                                total_llm_time = scene_info_time + perception_time + judgment_time
+                                logging.info(f"Agent_{j}--Total_LLM_Time_So_Far: {total_llm_time:.3f}s")
 
-                                    for element in full_Frontiers_dict.keys():
-                                        if element not in full_Frontiers_dict_copy.keys():
-                                            missing_key_F.append(element)
-                                    # for element in history_nodes:
-                                    #     if element not in history_nodes_copy:
-                                    #         missing_index_H.append(element.index(element))
-                                if FN_PR[0] >= 0.5 or agent[j].l_step <= 125:
-                                    # ------------------------------------------------------------------
-                                    #### Decision VLM
-                                    # ------------------------------------------------------------------
-                                    if len(pre_goal_points) > 0:
-                                        Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(Scene_Information, agents_seg_list, pre_goal_points[j], goal_name, start, full_Frontiers_dict_copy)
-                                    else:
-                                        Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(Scene_Information, agents_seg_list, pre_goal_points, goal_name, start, full_Frontiers_dict_copy)
-                                    
-                                    Meta_Score, Meta_Choice = cogvlm2.simple_image_chat(User_Prompt=Meta_Prompt,
-                                                                return_string_probabilities="[A, B, C, D]", img=sem_map_frontier)
+                                FN_PR = Perception_weight_decision(FN_Rel, FN_Decision)
+                                logging.info(f"Agent_{j}--FN_PR: {FN_PR}")
+                                if FN_PR == 'Neither':
+                                    FN_PR = FN_Rel
 
-                                    Final_PR = Perception_weight_decision4(Meta_Score, Meta_Choice)
-                                    
+                                
+                                
+                                angle_score = Perception_PR[0] * 2 + FN_PR[0]
+                                agent[j].angle_score = angle_score
+                                c_angle = int(start_o % 360)
+
+                                if is_exist_oldhistory == False:
+                                    if c_angle >= 39 and c_angle < 321:
+                                        history_state[c_angle-39:c_angle+39] = angle_score
+                                    elif c_angle < 39:
+                                        history_state[:c_angle+39] = angle_score
+                                        history_state[360-c_angle-39:] = angle_score
+
+                                    elif c_angle >= 321:
+                                        history_state[c_angle-39:] = angle_score
+                                        history_state[:c_angle+39-360] = angle_score
+                                    h_score = history_state.sum()
+                                    history_states.append(history_state)
+                                    history_score.append(h_score)
                                 else:
-                                    Final_PR = history_score_copy
+                                    if c_angle >= 39 and c_angle < 321:
+                                        history_states[closest_index][c_angle-39:c_angle+39] = angle_score
+                                    elif c_angle < 39:
+                                        history_states[closest_index][:c_angle] = angle_score
+                                        history_states[closest_index][360-c_angle:] = angle_score
+                                    elif c_angle >= 321:
+                                        history_states[closest_index][c_angle:] = angle_score
+                                        history_states[closest_index][:360-c_angle] = angle_score
+                                    h_score = history_states[closest_index].sum() / history_count[closest_index]
+                                    history_score[closest_index] = h_score
 
-                                logging.info(f"Agent_{j}--Final_PR: {Final_PR}")
+                            logging.info(f'=====> history_nodes: {history_nodes}')
+                            logging.info(f'=====> history_score: {history_score}')
+                            # Scores = []
+                            if j == 0:
+                                history_nodes_copy = history_nodes.copy()
+                                history_score_copy = history_score.copy()
+                                full_Frontiers_dict_copy = full_Frontiers_dict.copy()
+                            else:
+                                missing_key_F = []
+                                if len(full_Frontiers_dict) == 4:
+                                    frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
+                                elif len(full_Frontiers_dict) == 3:
+                                    frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2']
+                                elif len(full_Frontiers_dict) == 2:
+                                    frontier_keys = ['frontier_0', 'frontier_1']
+                                else:
+                                    frontier_keys = ['frontier_0']
 
-                                # Scores.append(Final_PR)
-                                Choice = Final_PR.index(max(Final_PR))
+                                for element in full_Frontiers_dict.keys():
+                                    if element not in full_Frontiers_dict_copy.keys():
+                                        missing_key_F.append(element)
+                                # for element in history_nodes:
+                                #     if element not in history_nodes_copy:
+                                #         missing_index_H.append(element.index(element))
+                            if FN_PR[0] >= 0.5 or agent[j].l_step <= 125:
+                                # ------------------------------------------------------------------
+                                #### Decision VLM
+                                # ------------------------------------------------------------------
+                                if len(pre_goal_points) > 0:
+                                    Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(Scene_Information, agents_seg_list, pre_goal_points[j], goal_name, start, full_Frontiers_dict_copy)
+                                else:
+                                    Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(Scene_Information, agents_seg_list, pre_goal_points, goal_name, start, full_Frontiers_dict_copy)
                                 
+                                # Time the Decision VLM call
+                                start_time = time.time()
+                                Meta_Score, Meta_Choice = cogvlm2.simple_image_chat(User_Prompt=Meta_Prompt,
+                                                            return_string_probabilities="[A, B, C, D]", img=sem_map_frontier)
+                                decision_time = time.time() - start_time
+                                logging.info(f"Agent_{j}--LLM_Decision_Time: {decision_time:.3f}s")
                                 
-                                if FN_PR[0] >= 0.5 or agent[j].l_step <= 125:
-                                    logging.info(f"VLM Choice: Agent_{j}-frontier_{Choice}")
-                                    Choice2 = Meta_Score.index(max(Meta_Score))
+                                # Calculate total LLM time for this agent (including decision)
+                                total_llm_time_with_decision = scene_info_time + perception_time + judgment_time + decision_time
+                                logging.info(f"Agent_{j}--Total_LLM_Time_Complete: {total_llm_time_with_decision:.3f}s")
 
-                                    if len(full_Frontiers_dict) == 1:
-                                        goal_points[j] = [int(x) for x in full_Frontiers_dict['frontier_0'].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                    
-                                    elif len(full_Frontiers_dict) == 2 and num_agents == 3:
-                                        if j == 0:
-                                            for i, key in enumerate(frontier_keys):
-                                                if Choice == i:
-                                                    if key in full_Frontiers_dict_copy:
-                                                        goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                        del full_Frontiers_dict_copy[key]
-                                        elif j == 1:
-                                            if len(missing_key_F) != 0:
-                                                for keys in missing_key_F:
-                                                    frontier_keys.remove(keys)
-                                            for i, key in enumerate(frontier_keys):
-                                                goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                        else:
-                                            if len(missing_key_F) != 0:
-                                                for keys in missing_key_F:
-                                                    frontier_keys.remove(keys)
-                                            for i, key in enumerate(frontier_keys):
-                                                goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                    
-                                    
-                                    else:
-                                        if j > 0:
-                                            if len(missing_key_F) != 0:
-                                                for keys in missing_key_F:
-                                                    frontier_keys.remove(keys)
-                                        else:
-                                            if len(full_Frontiers_dict) == 4:
-                                                frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
-                                            elif len(full_Frontiers_dict) == 3:
-                                                frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2']
-                                            elif len(full_Frontiers_dict) == 2:
-                                                frontier_keys = ['frontier_0', 'frontier_1']
-                                            else:
-                                                frontier_keys = ['frontier_0']
+                                Final_PR = Perception_weight_decision4(Meta_Score, Meta_Choice)
+                                
+                            else:
+                                Final_PR = history_score_copy
 
-                                        invalid_answer = False
+                            logging.info(f"Agent_{j}--Final_PR: {Final_PR}")
+
+                            # Scores.append(Final_PR)
+                            Choice = Final_PR.index(max(Final_PR))
+                            
+                            
+                            if FN_PR[0] >= 0.5 or agent[j].l_step <= 125:
+                                logging.info(f"VLM Choice: Agent_{j}-frontier_{Choice}")
+                                Choice2 = Meta_Score.index(max(Meta_Score))
+
+                                if len(full_Frontiers_dict) == 1:
+                                    goal_points[j] = [int(x) for x in full_Frontiers_dict['frontier_0'].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
+                                
+                                elif len(full_Frontiers_dict) == 2 and num_agents == 3:
+                                    if j == 0:
                                         for i, key in enumerate(frontier_keys):
                                             if Choice == i:
                                                 if key in full_Frontiers_dict_copy:
                                                     goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
                                                     del full_Frontiers_dict_copy[key]
-                                                else:
-                                                    invalid_answer = True
-                                                break
-                                        if invalid_answer:
-                                            for i, key in enumerate(frontier_keys):
-                                                if Choice2 == i:
-                                                    try:
-                                                        goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                        del full_Frontiers_dict_copy[key]
-                                                        break
-                                                    except:
-                                                        goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[frontier_keys[0]].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                        del full_Frontiers_dict_copy[frontier_keys[0]]
-                                                        break
-                                            
-
-                                else:
-                                    logging.info(f"VLM Choice: Agent_{j}-history_{Choice}")
-                                    if len(history_nodes_copy)==1:
-                                        goal_points[j] = history_nodes_copy[0]
+                                    elif j == 1:
+                                        if len(missing_key_F) != 0:
+                                            for keys in missing_key_F:
+                                                frontier_keys.remove(keys)
+                                        for i, key in enumerate(frontier_keys):
+                                            goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
                                     else:
-                                        for i in range(len(history_nodes_copy)):
-                                            if Choice == i:
-                                                goal_points[j] = history_nodes_copy[i]
-                                                del history_nodes_copy[i]
-                                                del history_score_copy[i]
-                                                break
+                                        if len(missing_key_F) != 0:
+                                            for keys in missing_key_F:
+                                                frontier_keys.remove(keys)
+                                        for i, key in enumerate(frontier_keys):
+                                            goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
+                                
+                                
+                                else:
+                                    if j > 0:
+                                        if len(missing_key_F) != 0:
+                                            for keys in missing_key_F:
+                                                frontier_keys.remove(keys)
+                                    else:
+                                        if len(full_Frontiers_dict) == 4:
+                                            frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
+                                        elif len(full_Frontiers_dict) == 3:
+                                            frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2']
+                                        elif len(full_Frontiers_dict) == 2:
+                                            frontier_keys = ['frontier_0', 'frontier_1']
+                                        else:
+                                            frontier_keys = ['frontier_0']
+
+                                    invalid_answer = False
+                                    for i, key in enumerate(frontier_keys):
+                                        if Choice == i:
+                                            if key in full_Frontiers_dict_copy:
+                                                goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
+                                                del full_Frontiers_dict_copy[key]
+                                            else:
+                                                invalid_answer = True
+                                            break
+                                    if invalid_answer:
+                                        for i, key in enumerate(frontier_keys):
+                                            if Choice2 == i:
+                                                try:
+                                                    goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
+                                                    del full_Frontiers_dict_copy[key]
+                                                    break
+                                                except:
+                                                    goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[frontier_keys[0]].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
+                                                    del full_Frontiers_dict_copy[frontier_keys[0]]
+                                                    break
+                                        
+
+                            else:
+                                logging.info(f"VLM Choice: Agent_{j}-history_{Choice}")
+                                if len(history_nodes_copy)==1:
+                                    goal_points[j] = history_nodes_copy[0]
+                                else:
+                                    for i in range(len(history_nodes_copy)):
+                                        if Choice == i:
+                                            goal_points[j] = history_nodes_copy[i]
+                                            del history_nodes_copy[i]
+                                            del history_score_copy[i]
+                                            break
+
+                            
+                            
+                        else:
                             logging.info(f'===== Agent_{j} No Frontier, Random Mode =====')
                             #### Modify to history node
                             agent[j].is_Frontier = False
@@ -1390,12 +1374,27 @@ def main():
                         #### Perception VLM
                         # ------------------------------------------------------------------
                         Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
+                        
+                        # Time the second Scene Information LLM call
+                        start_time = time.time()
                         _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
                                                                         return_string_probabilities=None, img=rgb)
+                        scene_info_time2 = time.time() - start_time
+                        logging.info(f"Agent_{j}--LLM_Scene_Info_Time2: {scene_info_time2:.3f}s")
+                        
+                        # Time the second Perception LLM call
+                        start_time = time.time()
                         Perception_Rel, Perception_Pred = cogvlm2.CoT2(User_Prompt1=Caption_Prompt, 
                                                                        User_Prompt2=VLM_Perception_Prompt,
                                                                        cot_pred1=Scene_Information,
                                                                        return_string_probabilities="[Yes, No]", img=rgb)
+                        perception_time2 = time.time() - start_time
+                        logging.info(f"Agent_{j}--LLM_Perception_Time2: {perception_time2:.3f}s")
+                        
+                        # Calculate total LLM time for the second set of calls
+                        total_llm_time2 = scene_info_time2 + perception_time2
+                        logging.info(f"Agent_{j}--Total_LLM_Time_Set2: {total_llm_time2:.3f}s")
+                        
                         Perception_Rel = np.array(Perception_Rel)
                         Perception_PR = Perception_weight_decision(Perception_Rel, Perception_Pred)
                         logging.info(f"Agent_{j}--VLM_PerceptionPR: {Perception_PR}")
@@ -1503,14 +1502,6 @@ def main():
                     target_point = start.copy()
             # logging.info(f"actions: {action}")
             observations = env.step(action)
-            
-            # ------------------------------------------------------------------
-            ##### AIDE Communication Handling
-            # ------------------------------------------------------------------
-            if args.aide:
-                # TODO: incoming = net.receive()
-                # aide.merge_summaries_into_agent_states(incoming)  # 去重合并到组目录/全局图
-                pass
             
             # exit(0)
                     
@@ -1702,6 +1693,23 @@ def main():
             log += " ---({:.0f}/{:.0f})".format(count_episodes, num_episodes)
         # log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(np.mean(total_usage))
         # print(log)
+        
+        # ------------------------------------------------------------------
+        # LLM Timing Summary for Episode
+        # ------------------------------------------------------------------
+        logging.info("="*50)
+        logging.info(f"EPISODE {count_episodes} LLM TIMING SUMMARY:")
+        logging.info("="*50)
+        
+        # Note: Individual LLM timing logs are already printed during execution
+        # This provides a summary at the end of each episode
+        logging.info("LLM timing breakdown:")
+        logging.info("- Scene Information: Initial scene understanding")
+        logging.info("- Perception: Object and scene analysis") 
+        logging.info("- Judgment: Frontier evaluation and decision making")
+        logging.info("- Decision: Final navigation choice")
+        logging.info("="*50)
+        
         logging.info(log)
         fn = '{}/MCoCoNav_history.log'.format(log_dir)
         if count_episodes == 1:

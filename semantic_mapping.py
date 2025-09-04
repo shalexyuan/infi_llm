@@ -239,3 +239,90 @@ class Semantic_Mapping(nn.Module):
         return mask
 
 
+def encode_map_to_tokens(map_state, frontier_nodes, history_nodes, goal_text):
+    """把对象/空间关系/历史/前沿压成结构化 token 列表（AIDE 分组的原料）"""
+    tokens = []
+    
+    # 目标对象信息
+    if goal_text:
+        tokens.append(f"GOAL:{goal_text}")
+    
+    # 地图状态编码（简化的空间关系）
+    if map_state is not None:
+        # 提取主要语义类别
+        if hasattr(map_state, 'shape') and len(map_state.shape) >= 3:
+            # 假设 map_state 是 [channels, height, width] 格式
+            semantic_channels = map_state.shape[0] if len(map_state.shape) == 3 else map_state.shape[1]
+            tokens.append(f"MAP_CHANNELS:{semantic_channels}")
+            
+            # 提取主要对象类型（简化版本）
+            if len(map_state.shape) == 3:
+                # 找到每个通道的最大值位置
+                for ch in range(min(semantic_channels, 10)):  # 限制通道数
+                    if ch < map_state.shape[0]:
+                        channel_data = map_state[ch]
+                        if hasattr(channel_data, 'max'):
+                            max_val = channel_data.max().item()
+                            if max_val > 0.1:  # 阈值过滤
+                                tokens.append(f"OBJ_CH{ch}:{max_val:.2f}")
+    
+    # 前沿节点信息
+    if frontier_nodes:
+        tokens.append(f"FRONTIER_COUNT:{len(frontier_nodes)}")
+        # 添加前沿节点的空间分布特征
+        if len(frontier_nodes) > 0:
+            x_coords = [node[0] for node in frontier_nodes if len(node) >= 2]
+            y_coords = [node[1] for node in frontier_nodes if len(node) >= 2]
+            if x_coords and y_coords:
+                x_center = sum(x_coords) / len(x_coords)
+                y_center = sum(y_coords) / len(y_coords)
+                tokens.append(f"FRONTIER_CENTER:({x_center:.1f},{y_center:.1f})")
+    
+    # 历史节点信息
+    if history_nodes:
+        tokens.append(f"HISTORY_COUNT:{len(history_nodes)}")
+        # 添加历史节点的访问模式特征
+        if len(history_nodes) > 0:
+            x_coords = [node[0] for node in history_nodes if len(node) >= 2]
+            y_coords = [node[1] for node in history_nodes if len(node) >= 2]
+            if x_coords and y_coords:
+                x_center = sum(x_coords) / len(x_coords)
+                y_center = sum(y_coords) / len(y_coords)
+                tokens.append(f"HISTORY_CENTER:({x_center:.1f},{y_center:.1f})")
+    
+    return tokens
+
+
+def group_signature(tokens):
+    """MinHash/SimHash；跨机器人去重用"""
+    import hashlib
+    import struct
+    
+    if not tokens:
+        return b'\x00' * 8  # 返回8字节的零哈希
+    
+    # 将tokens转换为字符串并排序以确保一致性
+    token_str = "|".join(sorted(tokens))
+    
+    # 使用SHA-256生成哈希
+    hash_obj = hashlib.sha256(token_str.encode('utf-8'))
+    hash_bytes = hash_obj.digest()
+    
+    # 返回前8字节作为签名（64位）
+    return hash_bytes[:8]
+
+
+def compute_group_similarity(signature1, signature2):
+    """计算两个组签名的相似度（用于去重）"""
+    if len(signature1) != 8 or len(signature2) != 8:
+        return 0.0
+    
+    # 计算汉明距离
+    xor_result = int.from_bytes(signature1, 'big') ^ int.from_bytes(signature2, 'big')
+    hamming_distance = bin(xor_result).count('1')
+    
+    # 转换为相似度（64位中相同的位数比例）
+    similarity = 1.0 - (hamming_distance / 64.0)
+    return similarity
+
+

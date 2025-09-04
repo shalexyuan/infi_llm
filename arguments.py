@@ -23,7 +23,7 @@ def get_args():
                         help='use rednet or sam')
     parser.add_argument('--yolo', type=str, default='yolov10',
                         help='yolo type')
-    parser.add_argument('--yolo_weights', type=str, default='detect/yolov10m',
+    parser.add_argument('--yolo_weights', type=str, default='jameslahm/yolov10m',
                         help='yolo_weights path')
     parser.add_argument('--log_interval', type=int, default=10,
                         help="""log interval, one log per n updates
@@ -57,9 +57,9 @@ def get_args():
     parser.add_argument('-el', '--max_episode_length', type=int, default=500,
                         help="""Maximum episode length""")
     parser.add_argument("--task_config", type=str,
-                        default="tasks/multi_objectnav_hm3d_1agent.yaml",
+                        default="tasks/multi_objectnav_hm3d.yaml",
                         help="path to config yaml containing task information")
-    parser.add_argument("--split", type=str, default="train",
+    parser.add_argument("--split", type=str, default="val_mini",
                         help="dataset split (train | val | val_mini) ")
     parser.add_argument('--camera_height', type=float, default=0.88,
                         help="agent camera height in metres (default:0.88)")
@@ -106,7 +106,24 @@ def get_args():
 
     # train_se_frontier
     parser.add_argument('--use_gtsem', type=int, default=0)
-    parser.add_argument('--num_agents', type=int, default=1)
+    parser.add_argument('--num_agents', type=int, default=2)
+    
+    # AIDE (Adaptive Inference with Distributed Efficiency) Arguments
+    parser.add_argument('--aide', action='store_true',
+                        help='Enable AIDE‑Swarm (AIRD + grouped KV + dual pricing)')
+    parser.add_argument('--aide-mem-bytes', type=int, default=8_000_000_000,
+                        help='Per-robot KV memory budget (bytes)')
+    parser.add_argument('--aide-comm-bytes', type=int, default=2_000_000,
+                        help='Global communication budget per step (bytes)')
+    parser.add_argument('--aide-epsilon', type=float, default=0.5,
+                        help='Attention interference budget ε; ensures ≥1/(1+ε) relevant attention share')
+    parser.add_argument('--aide-alpha', type=float, default=1.0,
+                        help='Base weight for interference term H')
+    parser.add_argument('--aide-lambda', type=float, default=1e-9,
+                        help='Base cost per byte for KV/communication')
+    parser.add_argument('--aide-topk-cands', type=int, default=6,
+                        help='Max number of frontier/history candidates passed to VLM planner')
+    
     parser.add_argument('--train_se_f', type=int, default=0)
     parser.add_argument('--load_se_edge', type=str, default="0",
                         help="""model path to load,
