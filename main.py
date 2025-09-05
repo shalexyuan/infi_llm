@@ -828,19 +828,19 @@ def main():
     # ------------------------------------------------------------------
     ##### AIDE Initialization
     # ------------------------------------------------------------------
-    aide = None
+    aide_controller = None
     price_server = None
     if args.aide:
         aide_cfg = AIDEConfig(
-            mem_bytes_robot=args.aide_mem_bytes,
-            comm_bytes_global=args.aide_comm_bytes,
-            epsilon_interf=args.aide_epsilon,
-            alpha_base=args.aide_alpha,
-            lambda_base=args.aide_lambda,
-            topk_candidates=args.aide_topk_cands
+            mem_bytes_robot=getattr(args, 'aide_mem_bytes', 8_000_000_000),
+            comm_bytes_global=getattr(args, 'aide_comm_bytes', 2_000_000),
+            epsilon_interf=getattr(args, 'aide_epsilon', 0.5),
+            alpha_base=getattr(args, 'aide_alpha', 1.0),
+            lambda_base=getattr(args, 'aide_lambda', 1e-9),
+            topk_candidates=getattr(args, 'aide_topk_cands', 6)
         )
         price_server = PriceServer(aide_cfg)      # p, τ 在此维护（或gossip）
-        aide = AIDEController(cogvlm2, aide_cfg, price_server)
+        aide_controller = AIDEController(cogvlm2, aide_cfg, price_server)
 
     # ------------------------------------------------------------------
     ##### Setup Logging
@@ -1049,10 +1049,8 @@ def main():
                         # full_rgb = np.hstack((rgb, sem_map))
 
                         
-                        # ------------------------------------------------------------------
-                        #### VLM Planning (Original or AIDE)
-                        # ------------------------------------------------------------------
-                        if args.aide:
+                        # === AIDE‑SWARM BEGIN: planning with AIDE ===
+                        if getattr(args, "aide", False):
                             # AIDE: Grouping-Scoring-Selection-KV Loading-Message Summary
                             agent_state = {
                                 'agent_id': j,
@@ -1069,8 +1067,11 @@ def main():
                                 'group_index': {'counter': 0}
                             }
                             
-                            summaries, goal = aide.step(agent_state, goal_name)  # AIDE 选择 + 受限提示
-                            # TODO: net.broadcast(summaries)  # 只发摘要（哈希/标量）
+                            summaries, goal = aide_controller.step(agent_state, goal_name)  # AIDE 选择 + 受限提示
+                            # 存储摘要信息供后续合并使用（无需网络通信）
+                            if not hasattr(agent[j], 'current_summaries'):
+                                agent[j].current_summaries = []
+                            agent[j].current_summaries = summaries
                             
                             if goal is not None:
                                 # Convert goal to expected format [x, y]
@@ -1088,6 +1089,7 @@ def main():
                                     actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
                                     goal_points[j] = [int(actions[0]), int(actions[1])]
                         else:
+                            # 原：直接给 VLM 长提示做全局规划
                             # Original VLM planning pipeline
                             Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
                             _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
@@ -1353,6 +1355,7 @@ def main():
                                 goal_points[j] = [int(actions[0]), int(actions[1])]
                             
                             
+                        # === AIDE‑SWARM END ===
                     
                     # all_objs.append(agent_objs) 
                     # all_VLM_Pred.append(agents_VLM_Pred)
@@ -1386,78 +1389,117 @@ def main():
                         
                         cur_goal_points.append(start)
 
-                        # ------------------------------------------------------------------
-                        #### Perception VLM
-                        # ------------------------------------------------------------------
-                        Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
-                        _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
-                                                                        return_string_probabilities=None, img=rgb)
-                        Perception_Rel, Perception_Pred = cogvlm2.CoT2(User_Prompt1=Caption_Prompt, 
-                                                                       User_Prompt2=VLM_Perception_Prompt,
-                                                                       cot_pred1=Scene_Information,
-                                                                       return_string_probabilities="[Yes, No]", img=rgb)
-                        Perception_Rel = np.array(Perception_Rel)
-                        Perception_PR = Perception_weight_decision(Perception_Rel, Perception_Pred)
-                        logging.info(f"Agent_{j}--VLM_PerceptionPR: {Perception_PR}")
+                        # === AIDE‑SWARM BEGIN: planning with AIDE (No Frontier case) ===
+                        if getattr(args, "aide", False):
+                            # AIDE: Grouping-Scoring-Selection-KV Loading-Message Summary
+                            agent_state = {
+                                'agent_id': j,
+                                'map_state': sem_map,  # Use sem_map as map_state
+                                'frontier_nodes': [],  # No frontiers in this case
+                                'history_nodes': history_nodes,
+                                'pose': {'x': start[0], 'y': start[1], 'theta': start_o},  # Convert to pose format
+                                'last_goal': pre_goal_points[j] if len(pre_goal_points) > 0 else None,
+                                'top_candidates': history_nodes[:3],  # Only history nodes available
+                                'node_from_choice': lambda choice: history_nodes[choice] if choice < len(history_nodes) else [0, 0],
+                                'groups': [],
+                                'group_directory': {},
+                                'global_graph': None,
+                                'group_index': {'counter': 0}
+                            }
+                            
+                            summaries, goal = aide_controller.step(agent_state, goal_name)  # AIDE 选择 + 受限提示
+                            # 存储摘要信息供后续合并使用（无需网络通信）
+                            if not hasattr(agent[j], 'current_summaries'):
+                                agent[j].current_summaries = []
+                            agent[j].current_summaries = summaries
+                            
+                            if goal is not None:
+                                # Convert goal to expected format [x, y]
+                                if isinstance(goal, dict):
+                                    goal_points[j] = [goal.get('x', 0), goal.get('y', 0)]
+                                elif isinstance(goal, list) and len(goal) >= 2:
+                                    goal_points[j] = goal[:2]
+                                else:
+                                    goal_points[j] = [0, 0]
+                            else:
+                                # Fallback to random goal if AIDE doesn't return one
+                                actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
+                                goal_points[j] = [int(actions[0]), int(actions[1])]
+                        else:
+                            # 原：直接给 VLM 长提示做全局规划
+                            # ------------------------------------------------------------------
+                            #### Perception VLM
+                            # ------------------------------------------------------------------
+                            Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
+                            _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
+                                                                            return_string_probabilities=None, img=rgb)
+                            Perception_Rel, Perception_Pred = cogvlm2.CoT2(User_Prompt1=Caption_Prompt, 
+                                                                           User_Prompt2=VLM_Perception_Prompt,
+                                                                           cot_pred1=Scene_Information,
+                                                                           return_string_probabilities="[Yes, No]", img=rgb)
+                            Perception_Rel = np.array(Perception_Rel)
+                            Perception_PR = Perception_weight_decision(Perception_Rel, Perception_Pred)
+                            logging.info(f"Agent_{j}--VLM_PerceptionPR: {Perception_PR}")
 
-                        is_exist_oldhistory = False
-                        if len(history_nodes) > 0:
-                            closest_index = -1
-                            min_distance = float('inf')
-                            new_x, new_y = start
-                            for i, (x, y) in enumerate(history_nodes):
-                                distance = math.sqrt((x - new_x) * (x - new_x) + (y - new_y) * (y - new_y))
-                                if distance < 25 and distance < min_distance:
-                                    min_distance = distance
-                                    closest_index = i
-                                    is_exist_oldhistory = True
+                            is_exist_oldhistory = False
+                            if len(history_nodes) > 0:
+                                closest_index = -1
+                                min_distance = float('inf')
+                                new_x, new_y = start
+                                for i, (x, y) in enumerate(history_nodes):
+                                    distance = math.sqrt((x - new_x) * (x - new_x) + (y - new_y) * (y - new_y))
+                                    if distance < 25 and distance < min_distance:
+                                        min_distance = distance
+                                        closest_index = i
+                                        is_exist_oldhistory = True
 
-                            if  is_exist_oldhistory == False:
+                                if  is_exist_oldhistory == False:
+                                    history_nodes.append(start)
+                                    history_count.append(1)
+                                    history_state = np.zeros(360)
+                                else:
+                                    history_count[closest_index] = history_count[closest_index] + 1
+
+                                
+                            else:
                                 history_nodes.append(start)
                                 history_count.append(1)
                                 history_state = np.zeros(360)
+
+
+                            angle_score = Perception_PR[0] * 2
+                            agent[j].angle_score = angle_score
+                            c_angle = int(start_o % 360)
+
+                            if is_exist_oldhistory == False:
+                                if c_angle >= 39 and c_angle < 321:
+                                    history_state[c_angle-39:c_angle+39] = angle_score
+                                elif c_angle < 39:
+                                    history_state[:c_angle+39] = angle_score
+                                    history_state[360-c_angle-39:] = angle_score
+
+                                elif c_angle >= 321:
+                                    history_state[c_angle-39:] = angle_score
+                                    history_state[:c_angle+39-360] = angle_score
+                                h_score = history_state.sum()
+                                history_states.append(history_state)
+                                history_score.append(h_score)
                             else:
-                                history_count[closest_index] = history_count[closest_index] + 1
-
-                            
-                        else:
-                            history_nodes.append(start)
-                            history_count.append(1)
-                            history_state = np.zeros(360)
-
-
-                        angle_score = Perception_PR[0] * 2
-                        agent[j].angle_score = angle_score
-                        c_angle = int(start_o % 360)
-
-                        if is_exist_oldhistory == False:
-                            if c_angle >= 39 and c_angle < 321:
-                                history_state[c_angle-39:c_angle+39] = angle_score
-                            elif c_angle < 39:
-                                history_state[:c_angle+39] = angle_score
-                                history_state[360-c_angle-39:] = angle_score
-
-                            elif c_angle >= 321:
-                                history_state[c_angle-39:] = angle_score
-                                history_state[:c_angle+39-360] = angle_score
-                            h_score = history_state.sum()
-                            history_states.append(history_state)
-                            history_score.append(h_score)
-                        else:
-                            if c_angle >= 39 and c_angle < 321:
-                                history_states[closest_index][c_angle-39:c_angle+39] = angle_score
-                            elif c_angle < 39:
-                                history_states[closest_index][:c_angle] = angle_score
-                                history_states[closest_index][360-c_angle:] = angle_score
-                            elif c_angle >= 321:
-                                history_states[closest_index][c_angle:] = angle_score
-                                history_states[closest_index][:360-c_angle] = angle_score
-                            h_score = history_states[closest_index].sum() / history_count[closest_index]
-                            history_score[closest_index] = h_score
+                                if c_angle >= 39 and c_angle < 321:
+                                    history_states[closest_index][c_angle-39:c_angle+39] = angle_score
+                                elif c_angle < 39:
+                                    history_states[closest_index][:c_angle] = angle_score
+                                    history_states[closest_index][360-c_angle:] = angle_score
+                                elif c_angle >= 321:
+                                    history_states[closest_index][c_angle:] = angle_score
+                                    history_states[closest_index][:360-c_angle] = angle_score
+                                h_score = history_states[closest_index].sum() / history_count[closest_index]
+                                history_score[closest_index] = h_score
 
 
-                        actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
-                        goal_points[j] = [int(actions[0]), int(actions[1])]
+                            actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
+                            goal_points[j] = [int(actions[0]), int(actions[1])]
+                        # === AIDE‑SWARM END ===
 
                         
                 # ------------------------------------------------------------------
@@ -1504,13 +1546,45 @@ def main():
             # logging.info(f"actions: {action}")
             observations = env.step(action)
             
-            # ------------------------------------------------------------------
-            ##### AIDE Communication Handling
-            # ------------------------------------------------------------------
-            if args.aide:
-                # TODO: incoming = net.receive()
-                # aide.merge_summaries_into_agent_states(incoming)  # 去重合并到组目录/全局图
-                pass
+            # === AIDE‑SWARM BEGIN: merge summaries and update dual prices ===
+            if getattr(args, "aide", False):
+                # 直接收集所有机器人的摘要信息（无需网络通信）
+                all_agent_summaries = []
+                all_agent_states = []
+                
+                # 收集所有机器人的状态和摘要
+                for i in range(num_agents):
+                    # 构建每个机器人的状态
+                    start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[i].planner_pose_inputs
+                    r, c = start_y, start_x
+                    start = [int(r * 100.0 / args.map_resolution - gx1),
+                            int(c * 100.0 / args.map_resolution - gy1)]
+                    start = pu.threshold_poses(start, agent[i].local_map[0, :, :].cpu().numpy().shape)
+                    
+                    agent_state = {
+                        'agent_id': i,
+                        'map_state': agent[i].local_map[4:, :, :].argmax(0).cpu().numpy(),  # 使用本地语义地图
+                        'frontier_nodes': agent_TargetPointMap[i] if i < len(agent_TargetPointMap) else [],
+                        'history_nodes': history_nodes,
+                        'pose': {'x': start[0], 'y': start[1], 'theta': start_o},
+                        'last_goal': pre_goal_points[i] if len(pre_goal_points) > 0 else None,
+                        'top_candidates': (agent_TargetPointMap[i] if i < len(agent_TargetPointMap) else []) + history_nodes[:3],
+                        'groups': [],
+                        'group_directory': {},
+                        'global_graph': None,
+                        'group_index': {'counter': 0}
+                    }
+                    
+                    all_agent_states.append(agent_state)
+                    # 收集每个机器人在当前步骤产生的摘要
+                    if hasattr(agent[i], 'current_summaries'):
+                        all_agent_summaries.append(agent[i].current_summaries)
+                    else:
+                        all_agent_summaries.append([])
+                
+                # 直接合并摘要到AIDE控制器（无需网络通信）
+                aide_controller.merge_summaries_into_agent_states(all_agent_states, all_agent_summaries)
+            # === AIDE‑SWARM END ===
             
             # exit(0)
                     
