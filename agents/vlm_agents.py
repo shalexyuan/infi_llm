@@ -581,6 +581,7 @@ class LLM_Agent(Agent):
 
         self.visited[gx1:gx2, gy1:gy2][start[0] - 0:start[0] + 1,
                                        start[1] - 0:start[1] + 1] = 1
+
         # if args.visualize or args.print_images:
             # Get last loc
         last_start_x, last_start_y = self.last_loc[0], self.last_loc[1]
@@ -658,24 +659,13 @@ class LLM_Agent(Agent):
             if eve_start_y >= map_pred.shape[0]: eve_start_y = map_pred.shape[0]-1 
             if eve_start_x < 0: eve_start_x = 0 
             if eve_start_y < 0: eve_start_y = 0 
-            allow_pitch_adjustments = True
-            if self.limit_pitch_initial:
-                first_planning_stage = (self.l_step == 0)
-                second_planning_stage = (
-                    self.args.num_local_steps > 0
-                    and self.l_step % self.args.num_local_steps == self.args.num_local_steps - 1
-                    and self.l_step < self.args.num_local_steps
-                )
-                allow_pitch_adjustments = first_planning_stage or second_planning_stage
-
-            if allow_pitch_adjustments:
-                if exp_pred[eve_start_x, eve_start_y] == 0 and self.eve_angle > -60:
-                    action = 5
-                    self.eve_angle -= 30
-                elif exp_pred[eve_start_x, eve_start_y] == 1 and self.eve_angle < 0:
-                    action = 4
-                    self.eve_angle += 30
-            if relative_angle > self.args.turn_angle:
+            if exp_pred[eve_start_x, eve_start_y] == 0 and self.eve_angle > -60:
+                action = 5
+                self.eve_angle -= 30
+            elif exp_pred[eve_start_x, eve_start_y] == 1 and self.eve_angle < 0:
+                action = 4
+                self.eve_angle += 30
+            elif relative_angle > self.args.turn_angle:
                 action = 3  # Right
             elif relative_angle < -self.args.turn_angle:
                 action = 2  # Left

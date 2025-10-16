@@ -44,23 +44,12 @@ from envs.habitat.multi_agent_env_vlm import Multi_Agent_Env
 # from envs.habitat.multi_agent_env import Multi_Agent_Env
 
 # from src.geom import get_cam_intr, get_scene_bnds
-from src.vlm import CogVLM2
-from src.SystemPrompt import (
-    form_prompt_for_PerceptionVLM, 
-    form_prompt_for_FN,
-    form_prompt_for_DecisionVLM_Frontier,
-    Perception_weight_decision,
-    Perception_weight_decision4,
-)
-
 import utils.pose as pu
 
 import utils.visualization as vu
 
 from arguments import get_args
 
-# from detect_yolov9 import Detect
-from detect.ultralytics import YOLOv10
 
 @habitat.registry.register_action_space_configuration
 class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
@@ -401,7 +390,7 @@ def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visi
         cv2.imwrite(fn, vis_image)   
 
 def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, pose_pred, full_map_pred, goal_name,
-                             visited_vis, map_edge, history_nodes, Frontiers_dict, goal_points, pre_goal_point):
+                             visited_vis, map_edge, Frontiers_dict, goal_points, pre_goal_point):
     full_w = full_map_pred.shape[1]
 
     map_pred = full_map_pred[0, :, :].cpu().numpy()
@@ -509,7 +498,6 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
                                 interpolation=cv2.INTER_NEAREST)
 
     color_black = (0,0,0)
-    color_green = (0,255,0)
     color_red = (0,0,255)
     color_blue = (255,0,0)
     pattern = r'<centroid: (.*?), (.*?), number: (.*?)>'
@@ -549,24 +537,6 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
                 cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_black, 1)
 
     sem_map_vis2 = sem_map_vis.copy()
-    beta = [chr(ord("a") + i) for i in range(26)]
-    alpha0 = 0
-    if len(history_nodes) > 0:
-        for hs in history_nodes[:26]:
-            centroid_x = int(hs[0])
-            centroid_y = int(hs[1])
-            cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_green, -1)
-            label = f"{beta[alpha0]}"
-            alpha0 += 1
-            cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_green, 1)
-        alpha0 = 0
-        for hs in history_nodes[26:]:
-            centroid_x = int(hs[0])
-            centroid_y = int(hs[1])
-            cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_green, -1)
-            label = f"{alpha[alpha0]}"
-            alpha0 += 1
-            cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_green, 1)
     # Iterate through the dictionary and draw polygons
     for key, value in agents_seg_list.items():
         # Convert each value into a format suitable for use with cv2.polylines (a numpy array).
@@ -761,6 +731,12 @@ def main():
     config_env = habitat.get_config(config_paths=["envs/habitat/configs/"
                                          + args.task_config])
     config_env.defrost()
+
+    if getattr(args, "val_idx", None) is not None and "objectnav_hm3d" in args.task_config:
+        idx = int(args.val_idx)
+        override_path = f"data/datasets/objectnav_hm3d_v2/val_{idx}/val.json.gz"
+        print(f"Overriding DATASET.DATA_PATH -> {override_path}")
+        config_env.DATASET.DATA_PATH = override_path
     
     agent_sensors = []
     agent_sensors.append("RGB_SENSOR")
@@ -785,22 +761,6 @@ def main():
     config_env.SIMULATOR.ACTION_SPACE_CONFIG = "PreciseTurn"
     config_env.freeze()
 
-    # ------------------------------------------------------------------
-    # Load VLM
-    # ------------------------------------------------------------------
-    # vlm = VLM(args.vlm_model_id, args.hf_token, device)
-    base_url = args.base_url 
-    cogvlm2 = CogVLM2(base_url) 
-    # ------------------------------------------------------------------
-    # Load Yolo
-    # ------------------------------------------------------------------
-    # yolo = Detect(imgsz=(args.env_frame_height, args.env_frame_width), device=device)
-    if args.yolo == 'yolov9':
-        # yolo = Detect(imgsz=(args.env_frame_height, args.env_frame_width), device=device)
-        pass
-    else:
-        yolo = YOLOv10.from_pretrained(args.yolo_weights)
-    # print(config_env)
     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
 
     
@@ -861,11 +821,6 @@ def main():
     last_decision = []
     total_usage = []
 
-    history_nodes = []
-    history_score = []
-    history_count = []
-    history_states = []
-
     cur_goal_points = []
     pre_goal_points = []
 
@@ -890,10 +845,6 @@ def main():
             if 'objectnav_hm3d' in args.task_config:
                 agent_GT[i].reset()
         
-        history_nodes.clear()
-        history_score.clear()
-        history_count.clear()
-        history_states.clear()
         pre_g_points.clear()
         target_point.clear()
 
@@ -903,8 +854,6 @@ def main():
 
         while not env.episode_over:
             
-            all_rgb = [] # hold the rgb of each robot
-
             Local_Policy = 0 # local policy
             start = time.time()
             count_rotating = 0
@@ -917,8 +866,6 @@ def main():
             full_map1 = []
             visited_vis = []
             pose_pred = []
-            agent_objs = {} # Record target detection information for each smart body in a single time step
-
             agent_FrontierList = [] # Record the robot Frontier
             agent_TargetEdgeMap = []
             agent_TargetPointMap = []
@@ -958,45 +905,53 @@ def main():
                 for j in range(num_agents):
                     agent[j].Perception_PR = 0
                 
+
                 agents_seg_list = Objects_Extract(args, full_map_pred, args.use_sam)
 
                 pre_goal_points.clear()
                 if len(cur_goal_points) > 0:
                     pre_goal_points = cur_goal_points.copy()
                     cur_goal_points.clear()
-                    
+
+
                 if len(full_target_point_map) > 0:
+                    initial_positions = None
+                    if agent[0].l_step == 0:
+                        map_dim = full_target_edge_map.shape[0]
+                        offset = max(1, map_dim // 4)
+                        center = map_dim // 2
+                        pos_a = [
+                            max(0, min(map_dim - 1, center - offset)),
+                            max(0, min(map_dim - 1, center - offset)),
+                        ]
+                        pos_b = [
+                            max(0, min(map_dim - 1, center + offset)),
+                            max(0, min(map_dim - 1, center + offset)),
+                        ]
+                        initial_positions = [pos_a, pos_b]
+
                     full_Frontiers_dict = {}
                     for j in range(len(full_target_point_map)):
                         full_Frontiers_dict['frontier_' + str(j)] = f"<centroid: {full_target_point_map[j][0], full_target_point_map[j][1]}, number: {full_Frontier_list[j]}>"
                     logging.info(f'=====> Frontier: {full_Frontiers_dict}')
 
-                    if len(history_nodes) > 0:
-                        logging.info(f'=====> history_nodes: {history_nodes}')
-                        logging.info(f'=====> history_score: {history_score}')
+                    available_frontiers = [[int(pt[0]), int(pt[1])] for pt in full_target_point_map]
+                    pattern = r'<centroid: (.*?), (.*?), number: (.*?)>'
 
+                    def parse_frontier_entry(entry):
+                        match = re.match(pattern, entry)
+                        if not match:
+                            return 9999, 9999, 0.0
+                        centroid_x = int(match.group(1)[1:])
+                        centroid_y = int(match.group(2)[:-1])
+                        area = float(match.group(3))
+                        return centroid_x, centroid_y, area
 
-                    # ------------------------------------------------------------------
-                    ##### VLM Preliminaries :>
-                    # ------------------------------------------------------------------
                     for j in range(num_agents):
                         agent[j].is_Frontier = True
                         rgb = observations[j]['rgb'].astype(np.uint8)
-                        
-                        # full_rgb1.append(full_rgb)
-                        all_rgb.append(rgb)
-                        goal_name = agent[j].goal_name
-                        if args.yolo == 'yolov9':
-                            agent_objs[f"agent_{j}"] = yolo.run(rgb) # Record target detection information for each robot in a single time step.
-                        else:
-                            yolo_output = yolo(source=rgb,conf=0.2)
-                            yolo_mapping = [yolo_output[0].names[int(c)] for c in yolo_output[0].boxes.cls]
-                            agent_objs[f"agent_{j}"] = {k: v for k, v in zip(yolo_mapping, yolo_output[0].boxes.conf)}
-                        # logging.info(agent_objs)
-                        
-                        # agents_seg_list = Objects_Extract(local_map1, args.use_sam)
-                        single_map = [full_map[j]]
 
+                        single_map = [full_map[j]]
                         full_map1.append(torch.cat([fm.unsqueeze(0) for fm in single_map], dim=0))
                         full_map_pred1, _ = torch.max(full_map1[j], 0)
                         Wall_list, Frontier_list, target_edge_map, target_point_map = Frontiers(full_map_pred1)
@@ -1005,410 +960,69 @@ def main():
                         agent_TargetPointMap.append(target_point_map)
                         agent_MapPred.append(full_map_pred1)
 
-                        
-
                         start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[j].planner_pose_inputs
                         r, c = start_y, start_x
                         start = [int(r * 100.0 / args.map_resolution - gx1),
                                 int(c * 100.0 / args.map_resolution - gy1)]
                         start = pu.threshold_poses(start, agent[j].local_map[0, :, :].cpu().numpy().shape)
-                        
-                        if len(pre_goal_points) > 0:
-                            # sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, agent_MapPred[j], 
-                            #                 agent[j].goal_id, visited_vis[j], agent_TargetEdgeMap[j], history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=pre_goal_points[j])
-                            sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
-                                    agent[0].goal_id, visited_vis, full_target_edge_map, history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=pre_goal_points[j])
-                        else:
-                            # sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, agent_MapPred[j], 
-                            #                 agent[j].goal_id, visited_vis[j], agent_TargetEdgeMap[j], history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=None)
-                            sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
-                                    agent[0].goal_id, visited_vis, full_target_edge_map, history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=None)
-                        # full_rgb = np.hstack((rgb, sem_map))
-
-                        
-                        # ------------------------------------------------------------------
-                        #### Perception VLM
-                        # ------------------------------------------------------------------
-                        Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
-                        _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
-                                                                        return_string_probabilities=None, img=rgb)
-                        Perception_Rel, Perception_Pred = cogvlm2.CoT2(User_Prompt1=Caption_Prompt, 
-                                                                       User_Prompt2=VLM_Perception_Prompt,
-                                                                       cot_pred1=Scene_Information,
-                                                                       return_string_probabilities="[Yes, No]", img=rgb)
-                        Perception_Rel = np.array(Perception_Rel)
-                        Perception_PR = Perception_weight_decision(Perception_Rel, Perception_Pred)
-                        logging.info(f"Agent_{j}--VLM_PerceptionPR: {Perception_PR}")
-                        # agents_VLM_Rel[f"Agent_{i}--VLM_PerceptionRel"] = Perception_Rel
-                        # agents_VLM_Pred[f"Agent_{i}--VLM_PerceptionPred"] = Perception_Pred
-                        # agents_VLM_PR[f"Agent_{i}--VLM_PerceptionPR"] = Perception_PR
-
-                        
-
-                        is_exist_oldhistory = False
-                        if len(history_nodes) > 0:
-                            closest_index = -1
-                            min_distance = float('inf')
-                            new_x, new_y = start
-                            for i, (x, y) in enumerate(history_nodes):
-                                distance = math.sqrt((x - new_x) * (x - new_x) + (y - new_y) * (y - new_y))
-                                if distance < 25 and distance < min_distance:
-                                    min_distance = distance
-                                    closest_index = i
-                                    is_exist_oldhistory = True
-
-                            if  is_exist_oldhistory == False:
-                                history_nodes.append(start)
-                                history_count.append(1)
-                                history_state = np.zeros(360)
-                            else:
-                                history_count[closest_index] = history_count[closest_index] + 1
-
-                            
-                        else:
-                            history_nodes.append(start)
-                            history_count.append(1)
-                            history_state = np.zeros(360)
-
-                        
                         cur_goal_points.append(start)
 
-                        if len(agent_TargetPointMap[j]) > 0:
-                            
-                            logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
+                        if initial_positions is not None:
+                            chosen = initial_positions[j] if j < len(initial_positions) else initial_positions[-1]
+                            goal_points[j] = chosen.copy()
+                            logging.info(f"Initial spread assignment for Agent_{j}: {goal_points[j]}")
+                            continue
 
-                            # ------------------------------------------------------------------
-                            #### Judgment VLM
-                            # ------------------------------------------------------------------
-                            if len(history_nodes) > 0:
-                                if len(pre_goal_points) > 0:
-                                    FN_Prompt = form_prompt_for_FN(goal_name, agents_seg_list, Perception_PR, pre_goal_points[j], full_Frontiers_dict, start, history_nodes)
-                                else:
-                                    FN_Prompt = form_prompt_for_FN(goal_name, agents_seg_list, Perception_PR, pre_goal_points, full_Frontiers_dict, start, history_nodes)
-                                # logging.info(FN_Prompt)
-                                
-                                FN_Rel, FN_Decision = cogvlm2.simple_image_chat(User_Prompt=FN_Prompt, 
-                                                                                        return_string_probabilities="[Yes, No]", img=sem_map)
-
-                                FN_PR = Perception_weight_decision(FN_Rel, FN_Decision)
-                                logging.info(f"Agent_{j}--FN_PR: {FN_PR}")
-                                if FN_PR == 'Neither':
-                                    FN_PR = FN_Rel
-
-                                
-                                
-                                angle_score = Perception_PR[0] * 2 + FN_PR[0]
-                                agent[j].angle_score = angle_score
-                                c_angle = int(start_o % 360)
-
-                                if is_exist_oldhistory == False:
-                                    if c_angle >= 39 and c_angle < 321:
-                                        history_state[c_angle-39:c_angle+39] = angle_score
-                                    elif c_angle < 39:
-                                        history_state[:c_angle+39] = angle_score
-                                        history_state[360-c_angle-39:] = angle_score
-
-                                    elif c_angle >= 321:
-                                        history_state[c_angle-39:] = angle_score
-                                        history_state[:c_angle+39-360] = angle_score
-                                    h_score = history_state.sum()
-                                    history_states.append(history_state)
-                                    history_score.append(h_score)
-                                else:
-                                    if c_angle >= 39 and c_angle < 321:
-                                        history_states[closest_index][c_angle-39:c_angle+39] = angle_score
-                                    elif c_angle < 39:
-                                        history_states[closest_index][:c_angle] = angle_score
-                                        history_states[closest_index][360-c_angle:] = angle_score
-                                    elif c_angle >= 321:
-                                        history_states[closest_index][c_angle:] = angle_score
-                                        history_states[closest_index][:360-c_angle] = angle_score
-                                    h_score = history_states[closest_index].sum() / history_count[closest_index]
-                                    history_score[closest_index] = h_score
-
-                            logging.info(f'=====> history_nodes: {history_nodes}')
-                            logging.info(f'=====> history_score: {history_score}')
-                            # Scores = []
-                            if j == 0:
-                                history_nodes_copy = history_nodes.copy()
-                                history_score_copy = history_score.copy()
-                                full_Frontiers_dict_copy = full_Frontiers_dict.copy()
-                            else:
-                                missing_key_F = []
-                                if len(full_Frontiers_dict) == 4:
-                                    frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
-                                elif len(full_Frontiers_dict) == 3:
-                                    frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2']
-                                elif len(full_Frontiers_dict) == 2:
-                                    frontier_keys = ['frontier_0', 'frontier_1']
-                                else:
-                                    frontier_keys = ['frontier_0']
-
-                                for element in full_Frontiers_dict.keys():
-                                    if element not in full_Frontiers_dict_copy.keys():
-                                        missing_key_F.append(element)
-                                # for element in history_nodes:
-                                #     if element not in history_nodes_copy:
-                                #         missing_index_H.append(element.index(element))
-                            if FN_PR[0] >= 0.5 or agent[j].l_step <= 125:
-                                # ------------------------------------------------------------------
-                                #### Decision VLM
-                                # ------------------------------------------------------------------
-                                if len(pre_goal_points) > 0:
-                                    Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(Scene_Information, agents_seg_list, pre_goal_points[j], goal_name, start, full_Frontiers_dict_copy)
-                                else:
-                                    Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(Scene_Information, agents_seg_list, pre_goal_points, goal_name, start, full_Frontiers_dict_copy)
-                                
-                                Meta_Score, Meta_Choice = cogvlm2.simple_image_chat(User_Prompt=Meta_Prompt,
-                                                            return_string_probabilities="[A, B, C, D]", img=sem_map_frontier)
-
-                                Final_PR = Perception_weight_decision4(Meta_Score, Meta_Choice)
-                                
-                            else:
-                                Final_PR = history_score_copy
-
-                            logging.info(f"Agent_{j}--Final_PR: {Final_PR}")
-
-                            # Scores.append(Final_PR)
-                            Choice = Final_PR.index(max(Final_PR))
-                            
-                            
-                            if FN_PR[0] >= 0.5 or agent[j].l_step <= 125:
-                                logging.info(f"VLM Choice: Agent_{j}-frontier_{Choice}")
-                                Choice2 = Meta_Score.index(max(Meta_Score))
-
-                                if len(full_Frontiers_dict) == 1:
-                                    goal_points[j] = [int(x) for x in full_Frontiers_dict['frontier_0'].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                
-                                elif len(full_Frontiers_dict) == 2 and num_agents == 3:
-                                    if j == 0:
-                                        for i, key in enumerate(frontier_keys):
-                                            if Choice == i:
-                                                if key in full_Frontiers_dict_copy:
-                                                    goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                    del full_Frontiers_dict_copy[key]
-                                    elif j == 1:
-                                        if len(missing_key_F) != 0:
-                                            for keys in missing_key_F:
-                                                frontier_keys.remove(keys)
-                                        for i, key in enumerate(frontier_keys):
-                                            goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                    else:
-                                        if len(missing_key_F) != 0:
-                                            for keys in missing_key_F:
-                                                frontier_keys.remove(keys)
-                                        for i, key in enumerate(frontier_keys):
-                                            goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                
-                                
-                                else:
-                                    if j > 0:
-                                        if len(missing_key_F) != 0:
-                                            for keys in missing_key_F:
-                                                frontier_keys.remove(keys)
-                                    else:
-                                        if len(full_Frontiers_dict) == 4:
-                                            frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
-                                        elif len(full_Frontiers_dict) == 3:
-                                            frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2']
-                                        elif len(full_Frontiers_dict) == 2:
-                                            frontier_keys = ['frontier_0', 'frontier_1']
-                                        else:
-                                            frontier_keys = ['frontier_0']
-
-                                    invalid_answer = False
-                                    for i, key in enumerate(frontier_keys):
-                                        if Choice == i:
-                                            if key in full_Frontiers_dict_copy:
-                                                goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                del full_Frontiers_dict_copy[key]
-                                            else:
-                                                invalid_answer = True
-                                            break
-                                    if invalid_answer:
-                                        for i, key in enumerate(frontier_keys):
-                                            if Choice2 == i:
-                                                try:
-                                                    goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                    del full_Frontiers_dict_copy[key]
-                                                    break
-                                                except:
-                                                    goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[frontier_keys[0]].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                    del full_Frontiers_dict_copy[frontier_keys[0]]
-                                                    break
-                                        
-
-                            else:
-                                logging.info(f"VLM Choice: Agent_{j}-history_{Choice}")
-                                if len(history_nodes_copy)==1:
-                                    goal_points[j] = history_nodes_copy[0]
-                                else:
-                                    for i in range(len(history_nodes_copy)):
-                                        if Choice == i:
-                                            goal_points[j] = history_nodes_copy[i]
-                                            del history_nodes_copy[i]
-                                            del history_score_copy[i]
-                                            break
-
-                            
-                            
+                        if len(pre_goal_points) > 0:
+                            sem_map, sem_map_frontier = Decision_Generation_Vis(
+                                args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred,
+                                full_map_pred, agent[0].goal_id, visited_vis, full_target_edge_map,
+                                full_Frontiers_dict, goal_points=[], pre_goal_point=pre_goal_points[j])
                         else:
-                            logging.info(f'===== Agent_{j} No Frontier, Random Mode =====')
-                            #### Modify to history node
-                            agent[j].is_Frontier = False
-                            c_angle = int(start_o % 360)
-                            angle_score = Perception_PR[0] * 2
-                            agent[j].angle_score = angle_score
+                            sem_map, sem_map_frontier = Decision_Generation_Vis(
+                                args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred,
+                                full_map_pred, agent[0].goal_id, visited_vis, full_target_edge_map,
+                                full_Frontiers_dict, goal_points=[], pre_goal_point=None)
 
-                            if is_exist_oldhistory == False:
-                                if c_angle >= 39 and c_angle < 321:
-                                    history_state[c_angle-39:c_angle+39] = angle_score
-                                elif c_angle < 39:
-                                    history_state[:c_angle+39] = angle_score
-                                    history_state[360-c_angle-39:] = angle_score
+                        if available_frontiers:
+                            scored_frontiers = []
+                            for key, entry in full_Frontiers_dict.items():
+                                cx, cy, area = parse_frontier_entry(entry)
+                                candidate = [int(cx), int(cy)]
+                                if candidate not in available_frontiers:
+                                    continue
+                                distance_to_agent = calculate_distance(candidate, start)
+                                scored_frontiers.append((distance_to_agent, area, key, candidate))
+                            scored_frontiers.sort(key=lambda item: item[0])
 
-                                elif c_angle >= 321:
-                                    history_state[c_angle-39:] = angle_score
-                                    history_state[:c_angle+39-360] = angle_score
-                                h_score = history_state.sum()
-                                history_states.append(history_state)
-                                history_score.append(h_score)
+                            if scored_frontiers:
+                                _, area, selected_key, selected_goal = scored_frontiers[0]
+                                goal_points[j] = selected_goal.copy()
+                                logging.info(f"Nearest frontier assigned to Agent_{j}: {selected_key} (area {area:.2f})")
+                                if selected_goal in available_frontiers:
+                                    available_frontiers.remove(selected_goal)
                             else:
-                                if c_angle >= 39 and c_angle < 321:
-                                    history_states[closest_index][c_angle-39:c_angle+39] = angle_score
-                                elif c_angle < 39:
-                                    history_states[closest_index][:c_angle] = angle_score
-                                    history_states[closest_index][360-c_angle:] = angle_score
-                                elif c_angle >= 321:
-                                    history_states[closest_index][c_angle:] = angle_score
-                                    history_states[closest_index][:360-c_angle] = angle_score
-                                h_score = history_states[closest_index].sum() / history_count[closest_index]
-                                history_score[closest_index] = h_score
-
-                            if j == 0:
-                                history_nodes_copy = history_nodes.copy()
-                                history_score_copy = history_score.copy()
-                                full_Frontiers_dict_copy = full_Frontiers_dict.copy()
-                            
-                            if len(full_Frontiers_dict) == 1:
-                                logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
-                                actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
+                                actions = np.random.rand(1, 2).squeeze() * (full_target_edge_map.shape[0] - 1)
                                 goal_points[j] = [int(actions[0]), int(actions[1])]
-                            else:
-                                if  j == 0:
-                                    frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
-                                logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
-                                actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
-                                goal_points[j] = [int(actions[0]), int(actions[1])]
-                            
-                            
-                    
-                    # all_objs.append(agent_objs) 
-                    # all_VLM_Pred.append(agents_VLM_Pred)
-                    # all_VLM_PR.append(agents_VLM_PR)
+                        else:
+                            actions = np.random.rand(1, 2).squeeze() * (full_target_edge_map.shape[0] - 1)
+                            goal_points[j] = [int(actions[0]), int(actions[1])]
 
                 else:
-                    
                     logging.info(f'===== No Frontier, Random Mode===== ')
-                    logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
-                    
                     for j in range(num_agents):
                         agent[j].is_Frontier = False
                         rgb = observations[j]['rgb'].astype(np.uint8)
-                        
-                        # full_rgb1.append(full_rgb)
-                        all_rgb.append(rgb)
-                        goal_name = agent[j].goal_name
-                        if args.yolo == 'yolov9':
-                            agent_objs[f"agent_{j}"] = yolo.run(rgb) # Record target detection information for each smart body in a single time step
-                        else:
-                            yolo_output = yolo(source=rgb,conf=0.2)
-                            yolo_mapping = [yolo_output[0].names[int(c)] for c in yolo_output[0].boxes.cls]
-                            agent_objs[f"agent_{j}"] = {k: v for k, v in zip(yolo_mapping, yolo_output[0].boxes.conf)}
-                        # logging.info(agent_objs)
-
                         start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[j].planner_pose_inputs
                         r, c = start_y, start_x
                         start = [int(r * 100.0 / args.map_resolution - gx1),
                                 int(c * 100.0 / args.map_resolution - gy1)]
                         start = pu.threshold_poses(start, agent[j].local_map[0, :, :].cpu().numpy().shape)
-                        
                         cur_goal_points.append(start)
 
-                        # ------------------------------------------------------------------
-                        #### Perception VLM
-                        # ------------------------------------------------------------------
-                        Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
-                        _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
-                                                                        return_string_probabilities=None, img=rgb)
-                        Perception_Rel, Perception_Pred = cogvlm2.CoT2(User_Prompt1=Caption_Prompt, 
-                                                                       User_Prompt2=VLM_Perception_Prompt,
-                                                                       cot_pred1=Scene_Information,
-                                                                       return_string_probabilities="[Yes, No]", img=rgb)
-                        Perception_Rel = np.array(Perception_Rel)
-                        Perception_PR = Perception_weight_decision(Perception_Rel, Perception_Pred)
-                        logging.info(f"Agent_{j}--VLM_PerceptionPR: {Perception_PR}")
-
-                        is_exist_oldhistory = False
-                        if len(history_nodes) > 0:
-                            closest_index = -1
-                            min_distance = float('inf')
-                            new_x, new_y = start
-                            for i, (x, y) in enumerate(history_nodes):
-                                distance = math.sqrt((x - new_x) * (x - new_x) + (y - new_y) * (y - new_y))
-                                if distance < 25 and distance < min_distance:
-                                    min_distance = distance
-                                    closest_index = i
-                                    is_exist_oldhistory = True
-
-                            if  is_exist_oldhistory == False:
-                                history_nodes.append(start)
-                                history_count.append(1)
-                                history_state = np.zeros(360)
-                            else:
-                                history_count[closest_index] = history_count[closest_index] + 1
-
-                            
-                        else:
-                            history_nodes.append(start)
-                            history_count.append(1)
-                            history_state = np.zeros(360)
-
-
-                        angle_score = Perception_PR[0] * 2
-                        agent[j].angle_score = angle_score
-                        c_angle = int(start_o % 360)
-
-                        if is_exist_oldhistory == False:
-                            if c_angle >= 39 and c_angle < 321:
-                                history_state[c_angle-39:c_angle+39] = angle_score
-                            elif c_angle < 39:
-                                history_state[:c_angle+39] = angle_score
-                                history_state[360-c_angle-39:] = angle_score
-
-                            elif c_angle >= 321:
-                                history_state[c_angle-39:] = angle_score
-                                history_state[:c_angle+39-360] = angle_score
-                            h_score = history_state.sum()
-                            history_states.append(history_state)
-                            history_score.append(h_score)
-                        else:
-                            if c_angle >= 39 and c_angle < 321:
-                                history_states[closest_index][c_angle-39:c_angle+39] = angle_score
-                            elif c_angle < 39:
-                                history_states[closest_index][:c_angle] = angle_score
-                                history_states[closest_index][360-c_angle:] = angle_score
-                            elif c_angle >= 321:
-                                history_states[closest_index][c_angle:] = angle_score
-                                history_states[closest_index][:360-c_angle] = angle_score
-                            h_score = history_states[closest_index].sum() / history_count[closest_index]
-                            history_score[closest_index] = h_score
-
-
-                        actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
+                        actions = np.random.rand(1, 2).squeeze() * (full_target_edge_map.shape[0] - 1)
                         goal_points[j] = [int(actions[0]), int(actions[1])]
 
-                        
                 # ------------------------------------------------------------------
                 #### Logical Analysis
                 # ------------------------------------------------------------------
