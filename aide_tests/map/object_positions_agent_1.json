@@ -1,0 +1,130 @@
+{
+  "4": {
+    "category": "couch",
+    "category_id": 1,
+    "map_position": {
+      "x": 289,
+      "y": 255
+    },
+    "bounding_box": {
+      "min_x": 285,
+      "min_y": 250,
+      "max_x": 295,
+      "max_y": 261
+    },
+    "area": 73,
+    "confidence": 0.28636008501052856,
+    "step": 0,
+    "object_id": 4
+  },
+  "6": {
+    "category": "table",
+    "category_id": 13,
+    "map_position": {
+      "x": 267,
+      "y": 247
+    },
+    "bounding_box": {
+      "min_x": 264,
+      "min_y": 245,
+      "max_x": 272,
+      "max_y": 252
+    },
+    "area": 33,
+    "confidence": 0.1769886165857315,
+    "step": 0,
+    "object_id": 6
+  },
+  "13": {
+    "category": "table",
+    "category_id": 13,
+    "map_position": {
+      "x": 326,
+      "y": 293
+    },
+    "bounding_box": {
+      "min_x": 323,
+      "min_y": 290,
+      "max_x": 330,
+      "max_y": 298
+    },
+    "area": 31,
+    "confidence": 0.3195965886116028,
+    "step": 11,
+    "merged_from": [
+      7,
+      9,
+      "new_component"
+    ],
+    "object_id": 13
+  },
+  "22": {
+    "category": "chair",
+    "category_id": 0,
+    "map_position": {
+      "x": 263,
+      "y": 294
+    },
+    "bounding_box": {
+      "min_x": 247,
+      "min_y": 287,
+      "max_x": 277,
+      "max_y": 302
+    },
+    "area": 268,
+    "confidence": 0.35189884901046753,
+    "step": 9,
+    "merged_from": [
+      21,
+      20,
+      "new_component"
+    ],
+    "object_id": 22
+  },
+  "24": {
+    "category": "sink",
+    "category_id": 11,
+    "map_position": {
+      "x": 260,
+      "y": 314
+    },
+    "bounding_box": {
+      "min_x": 256,
+      "min_y": 312,
+      "max_x": 265,
+      "max_y": 317
+    },
+    "area": 33,
+    "confidence": 0.2417350858449936,
+    "step": 8,
+    "merged_from": [
+      5,
+      23,
+      "new_component"
+    ],
+    "object_id": 24
+  },
+  "26": {
+    "category": "chair",
+    "category_id": 0,
+    "map_position": {
+      "x": 333,
+      "y": 298
+    },
+    "bounding_box": {
+      "min_x": 331,
+      "min_y": 296,
+      "max_x": 336,
+      "max_y": 302
+    },
+    "area": 18,
+    "confidence": 0.2321714609861374,
+    "step": 11,
+    "merged_from": [
+      0,
+      25,
+      "new_component"
+    ],
+    "object_id": 26
+  }
+}

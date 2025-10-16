@@ -9,7 +9,7 @@ class AIDEConfig:
     max_group_kv_bytes: int = 1_000_000
     alpha_base: float = 1.0
     lambda_base: float = 1e-9
-    theta_sem: float = 0.25
+    theta_sem: float = 0.1
     epsilon_interf: float = 0.5
     mem_bytes_robot: int = 8_000_000_000
     comm_bytes_global: int = 2_000_000

@@ -2,12 +2,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
-
 # from utils.distributions import Categorical, DiagGaussian
 # from torch.distributions.categorical import Categorical
 from utils.model import get_grid, ChannelPool, Flatten, NNBase
 import utils.depth_utils as du
-
 
 class Semantic_Mapping(nn.Module):
 
@@ -63,8 +61,7 @@ class Semantic_Mapping(nn.Module):
 
     def forward(self, obs, pose_obs, maps_last, poses_last, eve_angle):
         bs, c, h, w = obs.size()
-        depth = obs[:, 3, :, :]   
-
+        depth = obs[:, 3, :, :]
         point_cloud_t = du.get_point_cloud_from_z_t(
             depth, self.camera_matrix, self.device, scale=self.du_scale)
 
@@ -225,7 +222,6 @@ class Semantic_Mapping(nn.Module):
             map_pred_stair[:, 0:1, :, :][diff_ob_ex == 1.0] = 0.0
 
         return translated.squeeze(0), map_pred.squeeze(0), map_pred_stair.squeeze(0), current_poses.squeeze(0)
-
 
     def get_mask(self, step_size):
         size = int(step_size) * 2 

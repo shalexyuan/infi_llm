@@ -47,6 +47,9 @@ class AgentStateAdapterGT:
         self.group_directory = set()
         self.global_graph = None
         self.group_index = {'counter': 0}
+
+        default_end = 4 + getattr(agent, 'num_semantic_classes', 0)
+        self.pred_semantic_slice = getattr(agent, 'pred_semantic_slice', slice(4, default_end if default_end > 4 else None))
     
     def encode_tokens_for_aide(self, goal_text: str) -> List[str]:
         """
@@ -75,7 +78,7 @@ class AgentStateAdapterGT:
             
             # Extract semantic categories (channels 4+)
             if self.local_map.shape[0] > 4:
-                semantic_channels = self.local_map[4:, :, :]
+                semantic_channels = self.local_map[self.pred_semantic_slice, :, :]
                 for ch in range(min(semantic_channels.shape[0], 20)):  # Limit channels
                     channel_data = semantic_channels[ch]
                     if torch.sum(channel_data > 0).item() > 0:

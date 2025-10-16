@@ -71,7 +71,7 @@ def spatial_semantic_cluster(tokens, aff, max_group_kv):
                 # 结合空间邻接性和语义亲和度
                 spatial_sim = compute_spatial_similarity(tokens[i], tokens[j])
                 semantic_sim = (aff[i] + aff[j]) / 2.0
-                aff_matrix[i, j] = 0.7 * spatial_sim + 0.3 * semantic_sim
+                aff_matrix[i, j] = 0.6 * spatial_sim + 0.4 * semantic_sim
     
     # 层次聚类
     clusters = hierarchical_clustering(aff_matrix, threshold=0.5)
@@ -225,7 +225,9 @@ def split_large_cluster(tokens, max_kv_bytes):
 
 def build_or_update_groups(agent_state, new_tokens, target_text, cfg):
     """构建或更新分组"""
-    aff = early_qk_affinity(agent_state.llm, new_tokens, target_text, cfg.early_layers)
+    # 支持字典和对象两种格式的agent_state
+    llm = agent_state.get('llm') if isinstance(agent_state, dict) else getattr(agent_state, 'llm', None)
+    aff = early_qk_affinity(llm, new_tokens, target_text, cfg.early_layers)
     clusters = spatial_semantic_cluster(new_tokens, aff, cfg.max_group_kv_bytes)
     groups = []
     

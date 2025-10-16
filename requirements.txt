@@ -4,3 +4,11 @@ scikit-image==0.23.1
 numpy>=1.20.2
 ifcfg
 tensorboard
+fastapi>=0.110
+uvicorn[standard]>=0.23
+transformers>=4.42
+accelerate>=0.30
+pydantic>=2.4
+safetensors>=0.4
+pydantic-settings>=2.3
+requests>=2.31

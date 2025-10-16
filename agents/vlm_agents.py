@@ -9,11 +9,11 @@ import argparse
 import os
 import re
 import random
-from typing import Dict, Optional
+from typing import Dict
 import math
 import time
 import logging
-
+import pdb
 import numba
 import numpy as np
 import torch
@@ -22,8 +22,8 @@ import gym
 from torchvision import transforms
 import torch.nn.functional as F
 
-from habitat.core.agent import Agent
-from habitat.core.simulator import Observations
+from habitat.core.agent import Agent  # pyright: ignore[reportMissingImports]
+from habitat.core.simulator import Observations  # pyright: ignore[reportMissingImports]
 
 from matplotlib import pyplot as plt
 from skimage import measure
@@ -44,7 +44,8 @@ from arguments import get_args
 
 from constants import (
     coco_categories, coco_categories_hm3d2mp3d,
-    gibson_coco_categories, color_palette, category_to_id, object_category
+    gibson_coco_categories, color_palette, category_to_id, object_category,
+    hm3d_category,sample_categories
 )
 from RedNet.RedNet_model import load_rednet
 from constants import mp_categories_mapping, mp_categories_mapping21
@@ -113,6 +114,7 @@ class LLM_Agent(Agent):
         self.l_step = 0
         self.episode_n = 0
         self.collision_n = 0
+        self.limit_pitch_initial = getattr(args, "limit_pitch_initial", False)
 
         self.collision_s = 0
         self.replan_count = 0
@@ -145,8 +147,8 @@ class LLM_Agent(Agent):
         ##### 4. Past Agent Locations
         ##### 5,6,7,.. : Semantic Categories
         # ------------------------------------------------------------------
-        nc = args.num_sem_categories + 4  # num channels
 
+        nc = args.num_sem_categories + 4
         # Calculating full and local map sizes
         self.map_size = args.map_size_cm // args.map_resolution
         self.full_w, self.full_h = self.map_size, self.map_size
@@ -157,7 +159,6 @@ class LLM_Agent(Agent):
         self.full_map = torch.zeros(nc, self.full_w, self.full_h).float().to(self.device)
         self.local_map = torch.zeros(nc, self.local_w,
                                 self.local_h).float().to(self.device)
-
         self.local_ob_map = np.zeros((self.local_w,
                                 self.local_h))
 
@@ -198,7 +199,6 @@ class LLM_Agent(Agent):
         # ------------------------------------------------------------------
         self.sem_map_module = Semantic_Mapping(args).to(self.device)
         self.sem_map_module.eval()
-
         # ------------------------------------------------------------------
         ##### Pred Map init
         # ------------------------------------------------------------------
@@ -254,6 +254,24 @@ class LLM_Agent(Agent):
         self.Start_Location = None
         self.Path_Length = 1e-5
 
+        # # Initialize planner pose window and Start_Location at episode start
+        # try:
+        #     # Use full local map window as initial planning bounds
+        #     self.planner_pose_inputs[3:] = [0, self.local_w, 0, self.local_h]
+        #     # Seed pose inputs with current location
+        #     self.planner_pose_inputs[:3] = [self.curr_loc[0], self.curr_loc[1], self.curr_loc[2]]
+
+        #     # Compute starting index in the local window coordinates
+        #     gx1, gy1 = 0, 0
+        #     r, c = self.curr_loc[1], self.curr_loc[0]
+        #     start = [int(r * 100.0 / self.args.map_resolution - gx1),
+        #              int(c * 100.0 / self.args.map_resolution - gy1)]
+        #     start = pu.threshold_poses(start, (self.local_w, self.local_h))
+        #     self.Start_Location = start
+        # except Exception:
+        #     # If any issue arises, leave Start_Location as None and allow higher-level skip logic
+        #     pass
+
     def set_legend(self):
         save_legend(self.object_category)
         self.legend = cv2.imread('img/legend.png')
@@ -293,7 +311,7 @@ class LLM_Agent(Agent):
                 possible_cats = list(np.arange(6))
                 goal_idx = np.random.choice(possible_cats)
                 self.goal_id = goal_idx
-                for key, value in gibson_coco_categories.items():
+                for key, value in sample_categories.items():
                     if value == goal_idx:
                         self.goal_name = key
 
@@ -313,7 +331,9 @@ class LLM_Agent(Agent):
                     elif 'objectnav_hm3d' in self.args.task_config:
                         self.vis_image = vu.init_vis_image(self.object_category[coco_categories_hm3d2mp3d[observations['objectgoal'][0]]], 0)
             # print("objectgoal: ", observations['objectgoal'])
-
+            # print("GOAL_ID: ", self.goal_id,"GOAL_NAME: ", self.goal_name)
+            # print("if 'objectgoal' in observations: ", 'objectgoal' in observations, "observations['objectgoal']: ", observations['objectgoal'])
+            
             if 'objectgoal' in observations:
                 if observations['objectgoal'][0] == 3:
                     return 0
@@ -328,24 +348,24 @@ class LLM_Agent(Agent):
         state = np.concatenate((rgb, depth), axis=2).transpose(2, 0, 1)
 
         if self.args.use_sam:
-            isChanged = (len(self.object_category) != len(object_category))
-            self.object_category = deepcopy(object_category)
-            if isChanged:
-                self.GSAM.set_text(object_category[:-1])
-                self.set_legend()
+            assert "not implemented"
+            # isChanged = (len(self.object_category) != len(object_category))
+            # self.object_category = deepcopy(object_category)
+            # if isChanged:
+            #     self.GSAM.set_text(object_category[:-1])
+            #     self.set_legend()
 
-            obs = self._preprocess_obs(state) 
+            # obs = self._preprocess_obs(state) 
         else:
-            obs = self._preprocess_obs_rednet(state) 
-
-        obs = torch.from_numpy(obs).float().to(self.device)
+            obs_np = self._preprocess_obs_rednet(state)
+        obs = torch.from_numpy(obs_np).float().to(self.device)
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
         ##### local semantic map updating
         # ------------------------------------------------------------------
         poses = torch.from_numpy(np.asarray(self.get_pose_change(observations['gps'], observations['compass']))).float().to(self.device)
-        
+
         points, self.local_map, self.local_map_stair, self.local_pose = \
             self.sem_map_module(obs.unsqueeze(0), poses.unsqueeze(0), self.local_map.unsqueeze(0), self.local_pose.unsqueeze(0), self.eve_angle)
 
@@ -427,7 +447,6 @@ class LLM_Agent(Agent):
                                 self.lmb[2]:self.lmb[3]]
         self.local_pose = self.full_pose - \
             torch.from_numpy(np.asarray(self.origins)).to(self.device).float()
-
         if self.replan_count > self.args.num_local_steps-5 or self.collision_n > self.args.num_local_steps - 5:
             self.collision_n = 0
             self.local_map.fill_(0.)
@@ -453,7 +472,19 @@ class LLM_Agent(Agent):
     
         local_goal_maps = np.zeros((self.local_w, self.local_h)) 
 
-        local_goal_maps[goal_points[0],goal_points[1]] = 1
+        # print(f"Agent {self.agent_id} received goal_points: {goal_points}")
+        # print(f"Agent {self.agent_id} local map shape: {self.local_w}x{self.local_h}")
+        
+        # Check if goal is within bounds
+        if 0 <= goal_points[0] < self.local_w and 0 <= goal_points[1] < self.local_h:
+            local_goal_maps[goal_points[0],goal_points[1]] = 1
+            # print(f"Agent {self.agent_id} goal set successfully at ({goal_points[0]}, {goal_points[1]})")
+        else:
+            # print(f"Agent {self.agent_id} goal OUT OF BOUNDS! Goal: {goal_points}, Map size: {self.local_w}x{self.local_h}")
+            # Set goal to center if out of bounds
+            center_x, center_y = self.local_w // 2, self.local_h // 2
+            local_goal_maps[center_x, center_y] = 1
+            # print(f"Agent {self.agent_id} using center as fallback: ({center_x}, {center_y})")
             # print("Don't Find the edge")
 
         if 'objectnav_mp3d' in self.args.task_config:
@@ -498,10 +529,11 @@ class LLM_Agent(Agent):
         self.last_action = action
         self.l_step += 1
 
-        if self.args.visualize or self.args.print_images:
-            self._visualize(planner_inputs, action)
+        # if self.args.visualize or self.args.print_images:
+        #     self._visualize(planner_inputs, action)
 
         return action
+
 
     def _plan(self, planner_inputs):
         """Function responsible for planning
@@ -549,7 +581,6 @@ class LLM_Agent(Agent):
 
         self.visited[gx1:gx2, gy1:gy2][start[0] - 0:start[0] + 1,
                                        start[1] - 0:start[1] + 1] = 1
-
         # if args.visualize or args.print_images:
             # Get last loc
         last_start_x, last_start_y = self.last_loc[0], self.last_loc[1]
@@ -627,13 +658,24 @@ class LLM_Agent(Agent):
             if eve_start_y >= map_pred.shape[0]: eve_start_y = map_pred.shape[0]-1 
             if eve_start_x < 0: eve_start_x = 0 
             if eve_start_y < 0: eve_start_y = 0 
-            if exp_pred[eve_start_x, eve_start_y] == 0 and self.eve_angle > -60:
-                action = 5
-                self.eve_angle -= 30
-            elif exp_pred[eve_start_x, eve_start_y] == 1 and self.eve_angle < 0:
-                action = 4
-                self.eve_angle += 30
-            elif relative_angle > self.args.turn_angle:
+            allow_pitch_adjustments = True
+            if self.limit_pitch_initial:
+                first_planning_stage = (self.l_step == 0)
+                second_planning_stage = (
+                    self.args.num_local_steps > 0
+                    and self.l_step % self.args.num_local_steps == self.args.num_local_steps - 1
+                    and self.l_step < self.args.num_local_steps
+                )
+                allow_pitch_adjustments = first_planning_stage or second_planning_stage
+
+            if allow_pitch_adjustments:
+                if exp_pred[eve_start_x, eve_start_y] == 0 and self.eve_angle > -60:
+                    action = 5
+                    self.eve_angle -= 30
+                elif exp_pred[eve_start_x, eve_start_y] == 1 and self.eve_angle < 0:
+                    action = 4
+                    self.eve_angle += 30
+            if relative_angle > self.args.turn_angle:
                 action = 3  # Right
             elif relative_angle < -self.args.turn_angle:
                 action = 2  # Left
@@ -716,11 +758,13 @@ class LLM_Agent(Agent):
             for i in range(16):
                 sem_seg_pred[:,:,i][semantic == i+1] = 1
         else: 
-            semantic_output = self._get_sem_pred(
-                rgb.astype(np.uint8), depth, use_seg=use_seg)
-            sam_semantic_pred = semantic_output['sam_semantic_pred']
-            sam_all_cls = convert_SAM(sam_semantic_pred, self.object_category)
-            sem_seg_pred = sam_all_cls
+            # sem_seg_pred = np.zeros((rgb.shape[0], rgb.shape[1], 15 + 1))
+            # semantic_output = self._get_sem_pred(
+            #     rgb.astype(np.uint8), depth, use_seg=use_seg)
+            # sam_semantic_pred = semantic_output['sam_semantic_pred']
+            # sam_all_cls = convert_SAM(sam_semantic_pred, self.object_category)
+            # sem_seg_pred = sam_all_cls
+            raise NotImplementedError
 
         depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
 
@@ -1012,8 +1056,8 @@ class LLM_Agent(Agent):
                                         args.exp_name)
         ep_dir = '{}/episodes/eps_{}/'.format(
             dump_dir, self.l_step)
-        if not os.path.exists(ep_dir):
-            os.makedirs(ep_dir)
+        # if not os.path.exists(ep_dir):
+        #     os.makedirs(ep_dir)
 
         local_w = inputs['map_pred'].shape[0]
 
@@ -1114,11 +1158,21 @@ class LLM_Agent(Agent):
             spl (float): Success weighted by Path Length
                         (See https://arxiv.org/pdf/1807.06757.pdf)
         """
-        # print("self.Start_Location:",self.Start_Location)
-        # print("cur_loc:",cur_loc)
-        # print("self.Path_Length:",self.Path_Length)
-        starting_distance = pu.get_l2_distance(self.Start_Location[0],cur_loc[0],self.Start_Location[1],cur_loc[1])
-        spl = min(success * starting_distance / self.Path_Length, 1)
+        # If Start_Location isn't initialized, skip computing SPL for this episode.
+        if self.Start_Location is None:
+            return None
+
+        # For unsuccessful episodes, SPL is defined as 0.
+        if not success:
+            return 0.0
+
+        # Guard against zero or near-zero path length.
         if self.Path_Length <= 1e-3:
-            spl = success * 1
-        return spl
+            return 1.0
+
+        starting_distance = pu.get_l2_distance(
+            self.Start_Location[0], cur_loc[0], self.Start_Location[1], cur_loc[1]
+        )
+
+        spl = min(1.0, (starting_distance / max(self.Path_Length, 1e-5)))
+        return float(spl)

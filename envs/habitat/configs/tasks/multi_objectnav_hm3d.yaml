@@ -53,4 +53,5 @@ DATASET:
   SPLIT: val
   DATA_PATH: "data/datasets/objectnav_hm3d_v2/{split}/{split}.json.gz"
   SCENES_DIR: "data/scene_datasets"
+  SHUFFLE: False
 

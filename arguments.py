@@ -34,6 +34,12 @@ def get_args():
                         help='path to dump models and log (default: ./MCoCoNav_EXP/)')
     parser.add_argument('--exp_name', type=str, default="exp1",
                         help='experiment name (default: exp1)')
+    parser.add_argument(
+        '--log_to_stdout',
+        action='store_true',
+        default=False,
+        help='Mirror log output to stdout in addition to the log file.'
+    )
     parser.add_argument('--save_periodic', type=int, default=500000,
                         help='Model save frequency in number of updates')
     parser.add_argument('-v', '--visualize', type=int, default=0,
@@ -44,6 +50,8 @@ def get_args():
                                 (default: 0)""")
     parser.add_argument('--print_images', type=int, default=1,
                         help='1: save visualization as images')
+    parser.add_argument('--save_semantic_vis', action='store_true', default=False,
+                        help='Save semantic visualization with legend for GT agents')
 
     # Environment, dataset and episode specifications
     parser.add_argument('-efw', '--env_frame_width', type=int, default=640,
@@ -59,6 +67,8 @@ def get_args():
     parser.add_argument("--task_config", type=str,
                         default="tasks/multi_objectnav_hm3d.yaml",
                         help="path to config yaml containing task information")
+    parser.add_argument("--val_idx", type=int, default=None,
+                        help="If set, override dataset path for a specific hm3d val shard")
     parser.add_argument("--split", type=str, default="val_mini",
                         help="dataset split (train | val | val_mini) ")
     parser.add_argument('--camera_height', type=float, default=0.88,
@@ -123,6 +133,10 @@ def get_args():
                         help='Base cost per byte for KV/communication')
     parser.add_argument('--aide-topk-cands', type=int, default=6,
                         help='Max number of frontier/history candidates passed to VLM planner')
+    parser.add_argument('--aide-debug', action='store_true',
+                        help='Dump AIRD subgroup assignment inputs/outputs for debugging')
+    parser.add_argument('--aide_score_bar', type=float, default=None,
+                        help='Optional minimum score required for AIDE subgroup selection')
     
     parser.add_argument('--train_se_f', type=int, default=0)
     parser.add_argument('--load_se_edge', type=str, default="0",

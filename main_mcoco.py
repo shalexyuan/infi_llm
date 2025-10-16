@@ -23,6 +23,7 @@ import quaternion
 import pickle
 import io
 import re
+import pdb
 
 from skimage import measure
 import skimage.morphology
@@ -58,13 +59,14 @@ from src.SystemPrompt import (
 )
 
 import utils.pose as pu
-
+import utils.depth_utils as du
 import utils.visualization as vu
 
 from arguments import get_args
 
 # from detect_yolov9 import Detect
 from detect.ultralytics import YOLOv10
+
 
 @habitat.registry.register_action_space_configuration
 class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
@@ -82,10 +84,9 @@ class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
 
         return config
 
-
 def Objects_Extract(args, full_map_pred, use_sam):
 
-    semantic_map = full_map_pred[4:]
+    semantic_map = full_map_pred[4:4 + args.num_sem_categories]
 
     dst = np.zeros(semantic_map[0, :, :].shape)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(7, 7))
@@ -268,7 +269,7 @@ def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visi
     map_pred = full_map_pred[0, :, :].cpu().numpy()
     exp_pred = full_map_pred[1, :, :].cpu().numpy()
 
-    sem_map = full_map_pred[4:, :,:].argmax(0).cpu().numpy()
+    sem_map = full_map_pred[4:4 + args.num_sem_categories, :,:].argmax(0).cpu().numpy()
 
     sem_map += 5
 
@@ -411,7 +412,7 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
     map_pred = full_map_pred[0, :, :].cpu().numpy()
     exp_pred = full_map_pred[1, :, :].cpu().numpy()
 
-    sem_map = full_map_pred[4:, :,:].argmax(0).cpu().numpy()
+    sem_map = full_map_pred[4:4 + args.num_sem_categories, :,:].argmax(0).cpu().numpy()
 
     sem_map += 5
 
@@ -641,7 +642,7 @@ def Visualize0(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, vis
     map_pred = full_map_pred[0, :, :].cpu().numpy()
     exp_pred = full_map_pred[1, :, :].cpu().numpy()
 
-    sem_map = full_map_pred[4:, :,:].argmax(0).cpu().numpy()
+    sem_map = full_map_pred[4:4 + args.num_sem_categories, :,:].argmax(0).cpu().numpy()
 
     sem_map += 5
 
@@ -934,6 +935,45 @@ def main():
                 agent[i].mapping(observations[i])
                 if 'objectnav_hm3d' in args.task_config:
                     agent_GT[i].mapping(observations[i])
+                    # print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                    # cat=['chair', 'table', 'picture', 'cabinet', 'cushion', 'sofa', 'bed', 'chest_of_drawers', 'plant', 'sink', 'toilet', 'stool', 'towel', 'tv_monitor', 'shower', 'bathtub', 'counter', 'fireplace', 'gym_equipment', 'seating', 'clothes', 'background']
+                    # # Plot the semantic segmentation over the RGB image using the category names in 'cat'
+                    # import matplotlib.pyplot as plt
+                    # import matplotlib.patches as mpatches
+
+
+                    # rgb_img = observations[i]['rgb']  # shape: (H, W, 3)
+                    # semantic = observations[i]['semantic']  # shape: (H, W)
+                    # # Build a color map for each category
+                    # num_classes = len(cat)
+                    # # Use a fixed colormap for reproducibility
+                    # cmap = plt.get_cmap('tab20', num_classes)
+                    # semantic_rgb = cmap(semantic % num_classes)[..., :3]  # shape: (H, W, 3), values in [0,1]
+
+                    # # Blend the RGB and semantic mask
+                    # alpha = 0.5
+                    # rgb_norm = rgb_img.astype(np.float32) / 255.0
+                    # overlay = (1 - alpha) * rgb_norm + alpha * semantic_rgb
+                    # overlay = np.clip(overlay, 0, 1)
+
+                    # # Plot
+                    # plt.figure(figsize=(8, 8))
+                    # plt.imshow(overlay)
+                    # # Build legend
+                    # handles = []
+                    # for idx, name in enumerate(cat):
+                    #     color = cmap(idx)[:3]
+                    #     handles.append(mpatches.Patch(color=color, label=name))
+                    # plt.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+                    # plt.axis('off')
+                    # plt.title("Semantic Overlay")
+                    # plt.tight_layout()
+                    # plt.savefig('semantic_overlay.png', dpi=300, bbox_inches='tight')
+                    # # INSERT_YOUR_CODE
+                    # # Also save the RGB image for debugging/inspection
+                    # plt.imsave('semantic_overlay_rgb.png', rgb_img)
+                    # plt.close()
+
                 local_map1, _ = torch.max(agent[i].local_map.unsqueeze(0), 0)
                 full_map.append(agent[i].local_map)
                 visited_vis.append(agent[i].visited_vis)
@@ -949,13 +989,14 @@ def main():
                 )
                 pose_pred.append(pos)
 
-                    
+
             full_map2 = torch.cat([fm.unsqueeze(0) for fm in full_map], dim=0)
             # full_map2 = full_map[0].unsqueeze(0)
             # logging.info(f"full_map2: {full_map2.shape}") #[x,20,480,480]
 
             full_map_pred, _ = torch.max(full_map2, 0)
             Wall_list, full_Frontier_list, full_target_edge_map, full_target_point_map = Frontiers(full_map_pred)
+
 
             if agent[0].goal_id + 4 > 24:
                 break
@@ -970,7 +1011,8 @@ def main():
                 if len(cur_goal_points) > 0:
                     pre_goal_points = cur_goal_points.copy()
                     cur_goal_points.clear()
-                    
+                
+                
                 if len(full_target_point_map) > 0:
                     full_Frontiers_dict = {}
                     for j in range(len(full_target_point_map)):
@@ -988,18 +1030,35 @@ def main():
                     for j in range(num_agents):
                         agent[j].is_Frontier = True
                         rgb = observations[j]['rgb'].astype(np.uint8)
+
+                        camera_matrix = du.get_camera_matrix(args.env_frame_width, args.env_frame_height, args.hfov)
                         
                         # full_rgb1.append(full_rgb)
                         all_rgb.append(rgb)
+                        # INSERT_YOUR_CODE
+
+                        os.makedirs('./aide_tests', exist_ok=True)
+                        cv2.imwrite('./aide_tests/obs1.png', cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                        
                         goal_name = agent[j].goal_name
+
                         if args.yolo == 'yolov9':
                             agent_objs[f"agent_{j}"] = yolo.run(rgb) # Record target detection information for each robot in a single time step.
                         else:
                             yolo_output = yolo(source=rgb,conf=0.2)
                             yolo_mapping = [yolo_output[0].names[int(c)] for c in yolo_output[0].boxes.cls]
                             agent_objs[f"agent_{j}"] = {k: v for k, v in zip(yolo_mapping, yolo_output[0].boxes.conf)}
-                        # logging.info(agent_objs)
                         
+                        # 获取深度信息和位姿信息
+                        depth = observations[j]['depth']  # 获取深度信息
+                        start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[j].planner_pose_inputs
+                        current_pose_4_obj_pose = [start_x, start_y, start_o]
+                        
+
+
+                        
+                        # logging.info(agent_objs)
+                        pdb.set_trace()
                         # agents_seg_list = Objects_Extract(local_map1, args.use_sam)
                         single_map = [full_map[j]]
 
@@ -1011,9 +1070,8 @@ def main():
                         agent_TargetPointMap.append(target_point_map)
                         agent_MapPred.append(full_map_pred1)
 
-                        
 
-                        start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[j].planner_pose_inputs
+                        
                         r, c = start_y, start_x
                         start = [int(r * 100.0 / args.map_resolution - gx1),
                                 int(c * 100.0 / args.map_resolution - gy1)]

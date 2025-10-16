@@ -1,0 +1,89 @@
+{
+  "9": {
+    "category": "table",
+    "category_id": 13,
+    "map_position": {
+      "x": 265,
+      "y": 239
+    },
+    "bounding_box": {
+      "min_x": 263,
+      "min_y": 237,
+      "max_x": 268,
+      "max_y": 243
+    },
+    "area": 18,
+    "confidence": 0.10290578007698059,
+    "step": 5,
+    "object_id": 9
+  },
+  "11": {
+    "category": "chair",
+    "category_id": 0,
+    "map_position": {
+      "x": 329,
+      "y": 280
+    },
+    "bounding_box": {
+      "min_x": 327,
+      "min_y": 278,
+      "max_x": 332,
+      "max_y": 283
+    },
+    "area": 13,
+    "confidence": 0.13749395310878754,
+    "step": 6,
+    "merged_from": [
+      0,
+      1,
+      "new_component"
+    ],
+    "object_id": 11
+  },
+  "17": {
+    "category": "couch",
+    "category_id": 1,
+    "map_position": {
+      "x": 287,
+      "y": 247
+    },
+    "bounding_box": {
+      "min_x": 285,
+      "min_y": 244,
+      "max_x": 291,
+      "max_y": 252
+    },
+    "area": 24,
+    "confidence": 0.27053943276405334,
+    "step": 5,
+    "merged_from": [
+      16,
+      15,
+      "new_component"
+    ],
+    "object_id": 17
+  },
+  "19": {
+    "category": "table",
+    "category_id": 13,
+    "map_position": {
+      "x": 337,
+      "y": 287
+    },
+    "bounding_box": {
+      "min_x": 335,
+      "min_y": 285,
+      "max_x": 340,
+      "max_y": 290
+    },
+    "area": 13,
+    "confidence": 0.10930069535970688,
+    "step": 5,
+    "merged_from": [
+      10,
+      18,
+      "new_component"
+    ],
+    "object_id": 19
+  }
+}

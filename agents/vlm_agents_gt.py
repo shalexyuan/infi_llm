@@ -9,11 +9,11 @@ import argparse
 import os
 import re
 import random
-from typing import Dict, Optional
+from typing import Dict
 import math
 import time
 import logging
-
+import pdb
 import numba
 import numpy as np
 import torch
@@ -22,8 +22,8 @@ import gym
 from torchvision import transforms
 import torch.nn.functional as F
 
-from habitat.core.agent import Agent
-from habitat.core.simulator import Observations
+from habitat.core.agent import Agent  # pyright: ignore[reportMissingImports]
+from habitat.core.simulator import Observations  # pyright: ignore[reportMissingImports]
 
 from matplotlib import pyplot as plt
 from skimage import measure
@@ -31,7 +31,7 @@ import skimage.morphology
 from PIL import Image
 from copy import deepcopy
 import numpy as np
-
+from skimage.morphology import binary_dilation, disk
 import cv2
 
 from semantic_mapping import Semantic_Mapping
@@ -39,15 +39,26 @@ import utils.pose as pu
 from utils.fmm_planner import FMMPlanner
 from utils.semantic_prediction import SemanticPredMaskRCNN
 import utils.visualization as vu
-from utils.visualization import save_legend
+from utils.visualization import save_legend, visualize_semantic_map, create_semantic_map_legend
 from arguments import get_args
 
 from constants import (
-    coco_categories, coco_categories_hm3d2mp3d,
-    gibson_coco_categories, color_palette, category_to_id, object_category
+    coco_categories,
+    coco_categories_hm3d2mp3d,
+    gibson_coco_categories,
+    color_palette,
+    category_to_id,
+    object_category,
+    cleaned_mapping,
+    hm3d_target_to_label,
+    mp3d_target_to_label,
+    hm3d_label_to_idx,
+    mp3d_label_to_idx,
 )
 from RedNet.RedNet_model import load_rednet
 from constants import mp_categories_mapping, hm3d_category
+
+import json
 
 # from Grounded_SAM.grounded_sam_demo import vis_semantics
 # from Grounded_SAM.gsam import GSAM, convert_SAM
@@ -84,6 +95,18 @@ class LLM_Agent_GT(Agent):
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
         self.object_category = deepcopy(object_category)
+
+        self.cleaned_mapping = {}
+        for key, value in cleaned_mapping.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                continue
+            norm_key = key.strip().lower()
+            norm_value = value.strip().lower()
+            self.cleaned_mapping[norm_key] = norm_value
+        self.hm3d_target_to_label = hm3d_target_to_label
+        self.mp3d_target_to_label = mp3d_target_to_label
+        self.hm3d_label_to_idx = hm3d_label_to_idx
+        self.mp3d_label_to_idx = mp3d_label_to_idx
 
         if args.cuda:
             torch.cuda.manual_seed(args.seed)
@@ -132,6 +155,7 @@ class LLM_Agent_GT(Agent):
         self.l_step = 0
         self.episode_n = 0
         self.collision_n = 0
+        self.limit_pitch_initial = getattr(args, "limit_pitch_initial", False)
 
         self.collision_s = 0
         self.replan_count = 0
@@ -338,7 +362,7 @@ class LLM_Agent_GT(Agent):
                     return 0
         # ------------------------------------------------------------------
 
-
+        import pdb
         # ------------------------------------------------------------------
         ##### Preprocess the observation
         # ------------------------------------------------------------------
@@ -346,6 +370,147 @@ class LLM_Agent_GT(Agent):
         depth = observations['depth']
         semantic = observations['semantic']
         cur_mapping = observations['cur_mapping']
+
+        # print("cur_mapping: ", cur_mapping)
+        # pdb.set_trace()
+        # Semantic visualization with legend (controlled by flag)
+        if hasattr(self.args, 'save_semantic_vis') and self.args.save_semantic_vis:
+            # Get unique semantic labels and create color map
+            unique_labels = np.unique(semantic)
+            num_labels = len(unique_labels)
+            
+            # Create colormap using matplotlib's tab20 colormap
+            import matplotlib.pyplot as plt
+            cmap = plt.cm.get_cmap('tab20')
+            # Create color map with semantic ID as key
+            color_map = {label: np.array(cmap(i)[:3])*255 for i, label in enumerate(unique_labels)}
+            
+            # Create semantic mask overlay
+            semantic_vis = np.zeros_like(rgb)
+            for label in unique_labels:
+                mask = semantic == label
+                semantic_vis[mask] = color_map[label]
+                
+            # Blend RGB with semantic visualization
+            alpha = 0.7  # Transparency of semantic overlay
+            rgb_with_sem = cv2.addWeighted(rgb, 1-alpha, semantic_vis.astype(np.uint8), alpha, 0)
+            
+            # Save semantic visualization to debug directory
+            save_path = f"/scratch/sy2366/Project/multirobot_infi_llm/VLM_EXP/debug/gt_vis_{self.agent_id}"
+            os.makedirs(save_path, exist_ok=True)
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.3  # Smaller font
+            font_thickness = 1
+            padding = 3
+            
+            # Create a list of unique semantic values and their text labels
+            unique_semantics = np.unique(semantic)
+            text_positions = []
+            
+            # Start text from top-left
+            text_y = 20
+            
+            for sem_id in unique_semantics:
+                if sem_id in cur_mapping:
+                    # Get category name from mapping
+                    category = cur_mapping[sem_id]
+                    
+                    # Create text with semantic ID and category
+                    text = f"ID {sem_id}: {category}"
+                    
+                    # Get text size
+                    (text_width, text_height), _ = cv2.getTextSize(text, font, font_scale, font_thickness)
+                    
+                    # Draw text with contrasting background
+                    cv2.putText(rgb_with_sem, text, (10, text_y), 
+                              font, font_scale, (255, 255, 255), font_thickness + 1)  # White outline
+                    cv2.putText(rgb_with_sem, text, (10, text_y),
+                              font, font_scale, color_map[sem_id], font_thickness)  # Colored text
+                    
+                    text_y += text_height + padding + 5
+            
+            # Create reverse mapping from semantic ID to category name
+            reverse_mapping = {v: k for k, v in cur_mapping.items()}
+
+            
+            # Create CURRENT FRAME legend on the right side of the image
+            legend_x = rgb_with_sem.shape[1] - 150  # Smaller legend width
+            legend_y = 30
+            legend_item_height = 15  # Smaller item height
+            
+            # Draw legend background
+            legend_width = 140  # Smaller legend width
+            legend_height = len(unique_semantics) * legend_item_height + 15
+            cv2.rectangle(rgb_with_sem, (legend_x - 5, legend_y - 5), 
+                         (legend_x + legend_width, legend_y + legend_height), (0, 0, 0), -1)
+            cv2.rectangle(rgb_with_sem, (legend_x - 5, legend_y - 5), 
+                         (legend_x + legend_width, legend_y + legend_height), (255, 255, 255), 1)
+            
+            # Add legend title
+            title_text = "CURRENT FRAME"
+            (title_width, title_height), _ = cv2.getTextSize(title_text, font, font_scale, font_thickness)
+            cv2.putText(rgb_with_sem, title_text, (legend_x, legend_y), 
+                       font, font_scale, (255, 255, 255), font_thickness)
+            
+            legend_y += title_height + 10
+            
+            # Add each semantic category to the legend
+            for sem_id in unique_semantics:
+                # Get category name from reverse mapping
+                if sem_id in reverse_mapping:
+                    category = reverse_mapping[sem_id]
+                else:
+                    # Try to get category from object_category if sem_id is a valid index
+                    if 0 <= sem_id < len(self.object_category):
+                        category = self.object_category[sem_id]
+                    else:
+                        category = f"Unknown_{sem_id}"
+                
+                # Use the actual color from color_map
+                if sem_id in color_map:
+                    actual_color = tuple(map(int, color_map[sem_id]))
+                else:
+                    actual_color = (255, 0, 0)  # Red for debugging
+                
+                # Draw color box with actual color (smaller box)
+                color_box_x = legend_x
+                color_box_y = legend_y - 8
+                cv2.rectangle(rgb_with_sem, (color_box_x, color_box_y), 
+                             (color_box_x + 12, color_box_y + 8), 
+                             actual_color, -1)
+                cv2.rectangle(rgb_with_sem, (color_box_x, color_box_y), 
+                             (color_box_x + 12, color_box_y + 8), 
+                             (255, 255, 255), 1)
+                
+                # Draw category text
+                text = f"ID {sem_id}: {category}"
+                cv2.putText(rgb_with_sem, text, (color_box_x + 15, legend_y), 
+                           font, font_scale, (255, 255, 255), font_thickness)
+                
+                legend_y += legend_item_height
+            
+            
+            # Save the image with text labels
+            cv2.imwrite(f"{save_path}/semantic_vis_labeled_{self.l_step}.png", rgb_with_sem[:,:,::-1])
+
+
+        # Print unique values and their pixel counts in semantic map
+        # unique_values, counts = np.unique(semantic, return_counts=True)
+        # print("Semantic map unique values and counts:")
+        # for val, count in zip(unique_values, counts):
+        #     print(f"Value {val}: {count} pixels")
+        
+        # # Save cur_mapping to JSON file
+        # import json
+        # import os
+        # mapping_save_path = f"/scratch/sy2366/Project/multirobot_infi_llm/VLM_EXP/debug/iter_val_26/dump/exp1/episodes/mappings"
+        # os.makedirs(mapping_save_path, exist_ok=True)
+        # mapping_file = f"{mapping_save_path}/mapping_{self.args.val_idx}.json"
+        # with open(mapping_file, 'w') as f:
+        #     json.dump(cur_mapping, f, indent=2)
+        # import sys
+        # sys.exit(0)
         state = np.concatenate((rgb, depth), axis=2).transpose(2, 0, 1)
 
         if self.args.use_sam:
@@ -366,10 +531,10 @@ class LLM_Agent_GT(Agent):
         ##### local semantic map updating
         # ------------------------------------------------------------------
         poses = torch.from_numpy(np.asarray(self.get_pose_change(observations['gps'], observations['compass']))).float().to(self.device)
-        
+        # pdb.set_trace()
         points, self.local_map, self.local_map_stair, self.local_pose = \
             self.sem_map_module(obs.unsqueeze(0), poses.unsqueeze(0), self.local_map.unsqueeze(0), self.local_pose.unsqueeze(0), self.eve_angle)
-
+        
 
         locs = self.local_pose.cpu().numpy()
         self.planner_pose_inputs[:3] = locs + self.origins
@@ -456,6 +621,149 @@ class LLM_Agent_GT(Agent):
             self.collision_n = 0
         # ------------------------------------------------------------------
         
+        # ------------------------------------------------------------------
+        ##### Save semantic map visualization at the end of mapping
+        # ------------------------------------------------------------------
+
+        # args = self.args
+
+        # inputs = {}
+        # # self.planner_pose_inputs[3:] = [0, self.local_w, 0, self.local_h]
+        # inputs['map_pred'] = self.local_map[0, :, :].cpu().numpy()
+        # inputs['exp_pred'] = self.local_map[1, :, :].cpu().numpy()
+        # inputs['pose_pred'] = self.planner_pose_inputs
+        # if self.args.visualize or self.args.print_images:
+        #     inputs['map_edge'] = self.target_edge_map
+        #     self.local_map[-1, :, :] = 1e-5
+        #     inputs['sem_map_pred'] = self.local_map[4:, :,
+        #                                     :].argmax(0).cpu().numpy()
+
+        # map_pred = inputs['map_pred']
+        # exp_pred = inputs['exp_pred']
+        # map_edge = inputs['map_edge']
+        # start_x, start_y, start_o, gx1, gx2, gy1, gy2 = inputs['pose_pred']
+
+        # sem_map = inputs['sem_map_pred']
+
+        # gx1, gx2, gy1, gy2 = int(gx1), int(gx2), int(gy1), int(gy2)
+
+        # sem_map += 5
+
+        # no_cat_mask = sem_map == 20
+        # map_mask = np.rint(map_pred) == 1
+        # exp_mask = np.rint(exp_pred) == 1
+        # edge_mask = map_edge == 1
+
+        # sem_map[no_cat_mask] = 0
+        # m1 = np.logical_and(no_cat_mask, exp_mask)
+        # sem_map[m1] = 2
+
+        # m2 = np.logical_and(no_cat_mask, map_mask)
+        # sem_map[m2] = 1
+
+        # sem_map[edge_mask] = 3
+
+
+        # color_pal = [int(x * 255.) for x in color_palette]
+        # sem_map_vis = Image.new("P", (sem_map.shape[1],
+        #                                 sem_map.shape[0]))
+        # sem_map_vis.putpalette(color_pal)
+        # sem_map_vis.putdata(sem_map.flatten().astype(np.uint8))
+        # sem_map_vis = sem_map_vis.convert("RGB")
+        # sem_map_vis = np.array(sem_map_vis)  # Convert PIL Image to numpy array
+        # sem_map_vis = np.flipud(sem_map_vis)
+
+        # sem_map_vis = sem_map_vis[:, :, [2, 1, 0]]
+        # sem_map_vis = cv2.resize(sem_map_vis, (480, 480),
+        #                             interpolation=cv2.INTER_NEAREST)
+
+        # ------------------------------------------------------------------
+        ##### Clean up semantic map before detection
+        # ------------------------------------------------------------------
+        # self._cleanup_semantic_map()
+        
+        # ------------------------------------------------------------------
+        ##### Extract object positions from semantic map
+        # ------------------------------------------------------------------
+        # pdb.set_trace()
+        
+        # object_positions = self.get_object_positions(self.local_map, self.object_category)
+        
+        # ------------------------------------------------------------------
+        ##### Clean up tracked objects every 10 steps
+        # ------------------------------------------------------------------
+        # if self.l_step % 10 == 0 and self.l_step > 0:
+        #     self._cleanup_tracked_objects(self.local_map, self.object_category)
+
+        # vis_image = vu.init_vis_image("test", "null")
+
+        # vis_image[50:530, 15:655] = self.rgb_vis
+        # vis_image[50:530, 670:1150] = sem_map_vis
+
+        # pos = (
+        #     (start_x * 100. / args.map_resolution - gy1)
+        #     * 480 / map_pred.shape[0],
+        #     (map_pred.shape[1] - start_y * 100. / args.map_resolution + gx1)
+        #     * 480 / map_pred.shape[1],
+        #     np.deg2rad(-start_o)
+        # )
+
+        # agent_arrow = vu.get_contour_points(pos, origin=(670, 50), size=10)
+        # color = (int(color_palette[11] * 255),
+        #             int(color_palette[10] * 255),
+        #             int(color_palette[9] * 255))
+        # cv2.drawContours(vis_image, [agent_arrow], 0, color, -1)
+
+        # # Draw object centroids on the map
+        # for obj in object_positions:
+        #     # Convert map coordinates to visualization coordinates
+        #     # Note: The semantic map is flipped vertically in the visualization
+        #     map_x = obj['map_position']['x']
+        #     map_y = obj['map_position']['y']
+            
+        #     # Scale to visualization size (480x480) and flip Y coordinate
+        #     vis_x = int(map_x * 480 / map_pred.shape[1])
+        #     vis_y = int((map_pred.shape[0] - map_y) * 480 / map_pred.shape[0])  # Flip Y coordinate
+        #     # vis_y = int(map_y * 480 / map_pred.shape[0])  # No flip
+        #     # Offset for the semantic map area in the visualization
+        #     vis_x += 670  # X offset for semantic map area
+        #     vis_y += 50   # Y offset for semantic map area
+            
+        #     # Draw centroid as a circle
+        #     cv2.circle(vis_image, (vis_x, vis_y), 3, (0, 255, 0), -1)  # Green circle
+            
+        #     # Draw category label
+        #     category = obj['category']
+        #     font = cv2.FONT_HERSHEY_SIMPLEX
+        #     font_scale = 0.4
+        #     thickness = 1
+        #     text_color = (0, 255, 0)  # Green text
+            
+        #     # Get text size to position it properly
+        #     text_size = cv2.getTextSize(category, font, font_scale, thickness)[0]
+        #     text_x = vis_x - text_size[0] // 2
+        #     text_y = vis_y - 8
+            
+        #     cv2.putText(vis_image, category, (text_x, text_y), font, font_scale, text_color, thickness)
+
+        # save_path="aide_tests/map/semantic_map_agent_{}_step_{}.png".format(self.agent_id, self.l_step)
+        # cv2.imwrite(save_path, vis_image)
+        
+        # # # Save object positions to file
+        # positions_save_path = "aide_tests/map/object_positions_agent_{}.json".format(self.agent_id)
+        # with open(positions_save_path, 'w') as f:
+        #     json.dump(self.tracked_objects, f, indent=2)
+        
+        # # Print object summary
+        # self.print_object_summary(object_positions)
+        
+        # if args.print_images:
+        #     fn = '{}/episodes/eps_{}/agent-{}-Vis-{}.png'.format(
+        #         dump_dir, self.episode_n,
+        #         self.agent_id, self.l_step)
+        #     cv2.imwrite(fn, self.vis_image)
+
+        # ------------------------------------------------------------------
 
     
     def act(self, goal_points: list, )-> Dict[str, int]:
@@ -489,7 +797,7 @@ class LLM_Agent_GT(Agent):
                 cat_semantic_scores = cv2.dilate(cat_semantic_scores, self.tv_kernel)
             local_goal_maps = self.find_big_connect(cat_semantic_scores)
             # found_goal = 1
-            found_goal = 0
+            found_goal = 1
             self.Find_Goal = True
      
         # ------------------------------------------------------------------
@@ -519,8 +827,8 @@ class LLM_Agent_GT(Agent):
         self.last_action = action
         self.l_step += 1
 
-        if self.args.visualize or self.args.print_images:
-            self._visualize(planner_inputs, action)
+        # if self.args.visualize or self.args.print_images:
+        #     self._visualize(planner_inputs, action)
 
         return action
 
@@ -570,6 +878,15 @@ class LLM_Agent_GT(Agent):
 
         self.visited[gx1:gx2, gy1:gy2][start[0] - 0:start[0] + 1,
                                        start[1] - 0:start[1] + 1] = 1
+
+        if planner_inputs.get('found_goal') == 1:
+            goal_cells = np.argwhere(goal > 0.5)
+            if goal_cells.size > 0:
+                dist_cells = np.min(np.linalg.norm(goal_cells - np.array(start), axis=1))
+                dist_m = dist_cells * args.map_resolution / 100.0
+                if dist_m <= getattr(args, 'success_dist', 1.0):
+                    logging.info(f"[GT] Agent {self.agent_id} within {dist_m:.2f}m of goal; stopping.")
+                    return 0
 
         # if args.visualize or args.print_images:
             # Get last loc
@@ -641,20 +958,32 @@ class LLM_Agent_GT(Agent):
             if relative_angle > 180:
                 relative_angle -= 360
 
-            ## add the evelution angle
+            # add the evelution angle
             eve_start_x = int(5 * math.sin(angle_st_goal) + start[0])
             eve_start_y = int(5 * math.cos(angle_st_goal) + start[1])
             if eve_start_x >= map_pred.shape[0]: eve_start_x = map_pred.shape[0]-1
             if eve_start_y >= map_pred.shape[0]: eve_start_y = map_pred.shape[0]-1 
             if eve_start_x < 0: eve_start_x = 0 
             if eve_start_y < 0: eve_start_y = 0 
-            if exp_pred[eve_start_x, eve_start_y] == 0 and self.eve_angle > -60:
-                action = 5
-                self.eve_angle -= 30
-            elif exp_pred[eve_start_x, eve_start_y] == 1 and self.eve_angle < 0:
-                action = 4
-                self.eve_angle += 30
-            elif relative_angle > self.args.turn_angle:
+            allow_pitch_adjustments = True
+            if self.limit_pitch_initial:
+                first_planning_stage = (self.l_step == 0)
+                second_planning_stage = (
+                    self.args.num_local_steps > 0
+                    and self.l_step % self.args.num_local_steps == self.args.num_local_steps - 1
+                    and self.l_step < self.args.num_local_steps
+                )
+                allow_pitch_adjustments = first_planning_stage or second_planning_stage
+
+            if allow_pitch_adjustments:
+                if exp_pred[eve_start_x, eve_start_y] == 0 and self.eve_angle > -60:
+                    # Disabled LOOK_DOWN action - use forward instead
+                    action = 1  # Forward
+                    # self.eve_angle -= 30  # Commented out to prevent angle tracking
+                elif exp_pred[eve_start_x, eve_start_y] == 1 and self.eve_angle < 0:
+                    action = 4
+                    self.eve_angle += 30
+            if relative_angle > self.args.turn_angle:
                 action = 3  # Right
             elif relative_angle < -self.args.turn_angle:
                 action = 2  # Left
@@ -719,6 +1048,37 @@ class LLM_Agent_GT(Agent):
 
         return (stg_x, stg_y), stop
 
+    def _assign_gt_semantics(
+        self,
+        semantic: np.ndarray,
+        cur_mapping: Dict[str, int],
+        sem_seg_pred_gt: np.ndarray,
+        dataset: str,
+    ) -> None:
+        if dataset == "hm3d":
+            target_to_label = self.hm3d_target_to_label
+            label_to_idx = self.hm3d_label_to_idx
+        else:
+            target_to_label = self.mp3d_target_to_label
+            label_to_idx = self.mp3d_label_to_idx
+
+        for raw_label, sem_id in cur_mapping.items():
+            if raw_label is None:
+                continue
+            label_key = str(raw_label).strip().lower()
+            target = self.cleaned_mapping.get(label_key)
+            if target is None or target == "ignore":
+                continue
+            dataset_label = target_to_label.get(target, target)
+            channel_idx = label_to_idx.get(dataset_label.strip().lower())
+            if channel_idx is None:
+                continue
+            try:
+                sem_value = int(sem_id)
+            except (TypeError, ValueError):
+                continue
+            sem_seg_pred_gt[:, :, channel_idx][semantic == sem_value] = 1
+
     def _preprocess_obs(self, obs, use_seg=True):
         args = self.args
         # print("obs: ", obs.shape)
@@ -737,11 +1097,13 @@ class LLM_Agent_GT(Agent):
             for i in range(16):
                 sem_seg_pred[:,:,i][semantic == i+1] = 1
         else: 
-            semantic_output = self._get_sem_pred(
-                rgb.astype(np.uint8), depth, use_seg=use_seg)
-            sam_semantic_pred = semantic_output['sam_semantic_pred']
-            sam_all_cls = convert_SAM(sam_semantic_pred, self.object_category)
-            sem_seg_pred = sam_all_cls
+            # semantic_output = self._get_sem_pred(
+            #     rgb.astype(np.uint8), depth, use_seg=use_seg)
+            # sam_semantic_pred = semantic_output['sam_semantic_pred']
+            # sam_all_cls = convert_SAM(sam_semantic_pred, self.object_category)
+            # sem_seg_pred = sam_all_cls
+
+            raise NotImplementedError
 
         depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
 
@@ -757,24 +1119,99 @@ class LLM_Agent_GT(Agent):
 
         return state
 
+    def _preprocess_obs_yolo(self, obs, semantic, cur_mapping, use_seg=True):
+        args = self.args
+        # print("obs: ", obs.shape)
+        obs = obs.transpose(1, 2, 0)
+        rgb = obs[:, :, :3]
+        depth = obs[:, :, 3:4]
+        semantic = np.asarray(semantic)
+        if semantic.ndim > 2:
+            semantic = np.squeeze(semantic)
+        semantic = semantic.astype(np.int32, copy=False)
+
+        if 'objectnav_hm3d' in args.task_config:
+            sem_seg_pred_gt = np.zeros(
+                (rgb.shape[0], rgb.shape[1], len(self.hm3d_label_to_idx) + 1),
+                dtype=np.float32,
+            )
+            self._assign_gt_semantics(
+                semantic,
+                cur_mapping,
+                sem_seg_pred_gt,
+                dataset="hm3d",
+            )
+        elif 'objectnav_mp3d' in args.task_config:
+            sem_seg_pred_gt = np.zeros(
+                (rgb.shape[0], rgb.shape[1], len(self.mp3d_label_to_idx) + 1),
+                dtype=np.float32,
+            )
+            self._assign_gt_semantics(
+                semantic,
+                cur_mapping,
+                sem_seg_pred_gt,
+                dataset="mp3d",
+            )
+
+        # exit(0)
+        self.rgb_vis = rgb[:, :, ::-1]
+        
+        ### gtsem
+        # sem_seg_pred_gt = self._preprocess_semantic(semantic)
+        # print(sem_seg_pred_gt.shape)
+        
+        # exit(0)
+        # sem_seg_pred = self._get_sem_pred(
+        #     rgb.astype(np.uint8), depth, use_seg=use_seg)
+        
+
+        depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
+
+        ds = args.env_frame_width // args.frame_width  # Downscaling factor
+        if ds != 1:
+            rgb = np.asarray(self.res(rgb.astype(np.uint8)))
+            depth = depth[ds // 2::ds, ds // 2::ds]
+            sem_seg_pred_gt = sem_seg_pred_gt[ds // 2::ds, ds // 2::ds]
+
+        depth = np.expand_dims(depth, axis=2)
+        state = np.concatenate((rgb, depth, sem_seg_pred_gt),
+                               axis=2).transpose(2, 0, 1)
+
+        return state
+
     def _preprocess_obs_rednet(self, obs, semantic, cur_mapping, use_seg=True):
         args = self.args
         # print("obs: ", obs.shape)
         obs = obs.transpose(1, 2, 0)
         rgb = obs[:, :, :3]
         depth = obs[:, :, 3:4]
-
+        semantic = np.asarray(semantic)
+        if semantic.ndim > 2:
+            semantic = np.squeeze(semantic)
+        semantic = semantic.astype(np.int32, copy=False)
 
         if 'objectnav_hm3d' in args.task_config:
-            sem_seg_pred_gt = np.zeros((rgb.shape[0], rgb.shape[1], 15 + 1))
-            for i in range(0,15):
-                sem_seg_pred_gt[:,:,i][semantic == cur_mapping[hm3d_category[i]] if hm3d_category[i] in cur_mapping else semantic == 0] = 1
-
-
+            sem_seg_pred_gt = np.zeros(
+                (rgb.shape[0], rgb.shape[1], len(self.hm3d_label_to_idx) + 1),
+                dtype=np.float32,
+            )
+            self._assign_gt_semantics(
+                semantic,
+                cur_mapping,
+                sem_seg_pred_gt,
+                dataset="hm3d",
+            )
         elif 'objectnav_mp3d' in args.task_config:
-            sem_seg_pred_gt = np.zeros((rgb.shape[0], rgb.shape[1], 20 + 1))
-            for i in range(0,20):
-                sem_seg_pred_gt[:,:,i][semantic == cur_mapping[object_category[i]] if object_category[i] in cur_mapping else semantic == 0] = 1
+            sem_seg_pred_gt = np.zeros(
+                (rgb.shape[0], rgb.shape[1], len(self.mp3d_label_to_idx) + 1),
+                dtype=np.float32,
+            )
+            self._assign_gt_semantics(
+                semantic,
+                cur_mapping,
+                sem_seg_pred_gt,
+                dataset="mp3d",
+            )
 
         # exit(0)
         self.rgb_vis = rgb[:, :, ::-1]
@@ -1035,8 +1472,8 @@ class LLM_Agent_GT(Agent):
                                         args.exp_name)
         ep_dir = '{}/episodes/eps_{}/'.format(
             dump_dir, self.l_step)
-        if not os.path.exists(ep_dir):
-            os.makedirs(ep_dir)
+        # if not os.path.exists(ep_dir):
+        #     os.makedirs(ep_dir)
 
         local_w = inputs['map_pred'].shape[0]
 
@@ -1094,6 +1531,7 @@ class LLM_Agent_GT(Agent):
         sem_map_vis.putpalette(color_pal)
         sem_map_vis.putdata(sem_map.flatten().astype(np.uint8))
         sem_map_vis = sem_map_vis.convert("RGB")
+        sem_map_vis = np.array(sem_map_vis)  # Convert PIL Image to numpy array
         sem_map_vis = np.flipud(sem_map_vis)
 
         sem_map_vis = sem_map_vis[:, :, [2, 1, 0]]
@@ -1129,6 +1567,7 @@ class LLM_Agent_GT(Agent):
         #         dump_dir, self.episode_n,
         #         self.agent_id, self.l_step)
         #     cv2.imwrite(fn, self.vis_image)
+    
     
     def get_spl(self, success, cur_loc):
         """This function computes evaluation metrics for the Object Goal task

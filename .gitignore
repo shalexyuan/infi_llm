@@ -7,3 +7,10 @@
 /VLM_EXP/
 /habitat-sim/
 /habitat-lab/
+*.png
+*.txt
+*.pt
+/__pycache__/
+*/__pycache__/*
+/script/
+*.pth

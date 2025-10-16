@@ -78,7 +78,12 @@ def compute_clip_similarity_fallback(group, target_text):
         
         # 特殊token的相似度调整
         if "GOAL:" in token:
-            max_sim = 1.0
+            # 检查GOAL token是否包含目标词
+            goal_content = token.split(":", 1)[1] if ":" in token else ""
+            if any(target_word in goal_content.lower() for target_word in target_words):
+                max_sim = 1.0
+            else:
+                max_sim = 0.5  # 部分匹配
         elif "FRONTIER" in token:
             max_sim = max_sim * 0.8
         elif "HISTORY" in token:

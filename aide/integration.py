@@ -104,8 +104,18 @@ def serialize_candidates(candidates: List[Dict], topk: int) -> Tuple[str, torch.
     cand_mask = torch.zeros(1000)  # 假设词汇表大小为1000
     
     for i, candidate in enumerate(candidates):
-        cand_type = candidate.get('type', 'unknown')
-        x, y = candidate.get('x', 0), candidate.get('y', 0)
+        # 支持字典和元组两种格式
+        if isinstance(candidate, dict):
+            cand_type = candidate.get('type', 'unknown')
+            x, y = candidate.get('x', 0), candidate.get('y', 0)
+        elif isinstance(candidate, (tuple, list)) and len(candidate) >= 2:
+            # 元组格式：(x, y) 或 (x, y, type)
+            x, y = candidate[0], candidate[1]
+            cand_type = candidate[2] if len(candidate) > 2 else 'location'
+        else:
+            # 默认处理
+            cand_type = 'unknown'
+            x, y = 0, 0
         
         cands_text += f"{i+1}. {cand_type} at ({x:.1f}, {y:.1f})\n"
         
