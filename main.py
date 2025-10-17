@@ -1144,7 +1144,7 @@ def main():
                                 full_Frontiers_dict, goal_points=[], pre_goal_point=None)
 
                         object_goal = None
-                        if grouper:
+                        if grouper and getattr(args, "goal_selection_mode", "llm") == "llm":
                             goal_hint = getattr(agent[j], "goal_name", getattr(agent[0], "goal_name", None))
                             try:
                                 object_goal = grouper.select_goal_object(

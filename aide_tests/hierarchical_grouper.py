@@ -139,6 +139,8 @@ class HierarchicalGrouper:
         self.goal_vector: Optional[np.ndarray] = None
         self._unique_category_set: Set[str] = set()
         self.unique_categories: List[str] = []
+        self.consumed_goal_ids: Set[int] = set()
+        self.consumed_subgroups: Set[Tuple[int, int]] = set()
 
     # --- public API -----------------------------------------------------
     def reset(self) -> None:
@@ -152,6 +154,8 @@ class HierarchicalGrouper:
         self.goal_vector = None
         self._unique_category_set.clear()
         self.unique_categories.clear()
+        self.consumed_goal_ids.clear()
+        self.consumed_subgroups.clear()
 
     def set_goal_text(self, text: Optional[str]) -> None:
         self.goal_text = text
@@ -279,6 +283,11 @@ class HierarchicalGrouper:
         for det_id, label in self.det_labels.items():
             if label != chosen_category:
                 continue
+            if det_id in self.consumed_goal_ids:
+                continue
+            cluster_mapping = self.det_to_cluster.get(det_id)
+            if cluster_mapping and cluster_mapping in self.consumed_subgroups:
+                continue
             det_pos = self.det_positions.get(det_id)
             if det_pos is None or det_pos.size < 2 or not np.all(np.isfinite(det_pos[:2])):
                 continue
@@ -318,6 +327,18 @@ class HierarchicalGrouper:
         }
         if distance is not None:
             goal_info["distance"] = distance
+
+        self.consumed_goal_ids.add(chosen_det_id)
+        cluster_mapping = self.det_to_cluster.get(chosen_det_id)
+        if cluster_mapping:
+            self.consumed_subgroups.add(cluster_mapping)
+            gid, cid = cluster_mapping
+            group = self.groups.get(gid)
+            if group is not None:
+                cluster = group.clusters.get(cid)
+                if cluster is not None:
+                    for member_id in cluster.member_ids:
+                        self.consumed_goal_ids.add(member_id)
 
         logging.info(
             "[HierGrouper] Selected goal object det_id=%s category='%s' at map (%d, %d).",
@@ -489,11 +510,23 @@ class HierarchicalGrouper:
 
     def _compute_cluster_centroid(self, cluster: SpatialCluster) -> Optional[np.ndarray]:
         embeds = []
+        reference_shape: Optional[Tuple[int, ...]] = None
         for det_id in cluster.member_ids:
             label = self.det_labels.get(det_id, "")
             emb = self._get_det_vector(det_id, label)
-            if emb is not None:
-                embeds.append(emb)
+            if emb is None:
+                continue
+            if reference_shape is None:
+                reference_shape = emb.shape
+            elif emb.shape != reference_shape:
+                logging.debug(
+                    "[HierGrouper] Skipping det_id=%s for centroid; shape %s mismatches reference %s",
+                    det_id,
+                    emb.shape,
+                    reference_shape,
+                )
+                continue
+            embeds.append(emb)
         if not embeds:
             return None
         mu = np.mean(np.stack(embeds, axis=0), axis=0)

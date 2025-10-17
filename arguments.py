@@ -160,6 +160,13 @@ def get_args():
     parser.add_argument('--max_step_room_size_ratio', type=int, default=3)
     parser.add_argument('--black_pixel_ratio', type=float, default=0.5)
     parser.add_argument('--min_random_init_steps', type=int, default=2)
+    parser.add_argument(
+        '--goal_selection_mode',
+        type=str,
+        default='llm',
+        choices=['llm', 'frontier'],
+        help='Select goal assignment strategy: LLM-based object targeting or nearest frontier exploration.'
+    )
 
     # VLM setup
     parser.add_argument('--base_url', type=str, default="http://127.0.0.1:31511")
