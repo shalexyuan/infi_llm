@@ -617,6 +617,7 @@ class LLM_Agent_GT(Agent):
         if self.replan_count > self.args.num_local_steps-5 or self.collision_n > self.args.num_local_steps - 5:
             self.collision_n = 0
             self.local_map.fill_(0.)
+            print("Collision detected, local map cleared")
         else:
             self.collision_n = 0
         # ------------------------------------------------------------------

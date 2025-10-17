@@ -447,9 +447,15 @@ class LLM_Agent(Agent):
                                 self.lmb[2]:self.lmb[3]]
         self.local_pose = self.full_pose - \
             torch.from_numpy(np.asarray(self.origins)).to(self.device).float()
+        # print("================================================")
+        # print("self.replan_count: ", self.replan_count, "self.collision_n: ", self.collision_n)
+        # print("self.args.num_local_steps: ", self.args.num_local_steps)
+        # print("================================================")
         if self.replan_count > self.args.num_local_steps-5 or self.collision_n > self.args.num_local_steps - 5:
             self.collision_n = 0
             self.local_map.fill_(0.)
+
+            print("Agent {} Collision detected, local map cleared".format(self.agent_id)    )
         else:
             self.collision_n = 0
         # ------------------------------------------------------------------
