@@ -1197,7 +1197,7 @@ def main():
                                 goal_points[j] = [int(actions[0]), int(actions[1])]
                         else:
                             actions = np.random.rand(1, 2).squeeze() * (full_target_edge_map.shape[0] - 1)
-                        goal_points[j] = [int(actions[0]), int(actions[1])]
+                            goal_points[j] = [int(actions[0]), int(actions[1])]
 
                 goal_planning_duration = time.perf_counter() - goal_planning_start
 

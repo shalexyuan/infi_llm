@@ -434,16 +434,16 @@ class HierarchicalGrouper:
                         llm_call_time * 1000.0,
                         parse_time * 1000.0,
                     )
+                    fallback_reason = "unexpected_token"
+                    total_elapsed = time.perf_counter() - total_start
+                    logging.debug(
+                        "[HierGrouper] timing semantic llm (unexpected token): total=%.3f ms (prepare=%.3f ms, llm=%.3f ms, parse=%.3f ms)",
+                        total_elapsed * 1000.0,
+                        prepare_time * 1000.0,
+                        llm_call_time * 1000.0,
+                        parse_time * 1000.0,
+                    )
                     return gid
-                fallback_reason = "unexpected_token"
-                total_elapsed = time.perf_counter() - total_start
-                logging.debug(
-                    "[HierGrouper] timing semantic llm (unexpected token): total=%.3f ms (prepare=%.3f ms, llm=%.3f ms, parse=%.3f ms)",
-                    total_elapsed * 1000.0,
-                    prepare_time * 1000.0,
-                    llm_call_time * 1000.0,
-                    parse_time * 1000.0,
-                )
                 else:
                     logging.warning(
                         "[HierGrouper] Unexpected LLM response %r; defaulting to new group for det_id=%s label=%s",
@@ -476,7 +476,7 @@ class HierarchicalGrouper:
             total_elapsed = time.perf_counter() - total_start
             logging.debug(
                 "[HierGrouper] timing semantic llm (fallback_new_group%s): total=%.3f ms (prepare=%.3f ms, llm=%.3f ms, parse=%.3f ms)",
-                "" if fallback_reason is None else f\"_{fallback_reason}\",
+                "" if fallback_reason is None else f"_{fallback_reason}",
                 total_elapsed * 1000.0,
                 prepare_time * 1000.0,
                 llm_call_time * 1000.0,
