@@ -1110,6 +1110,8 @@ def main():
                         area = float(match.group(3))
                         return centroid_x, centroid_y, area
 
+                    selected_goal_ids = set()
+
                     for j in range(num_agents):
                         agent[j].is_Frontier = True
                         rgb = observations[j]['rgb'].astype(np.uint8)
@@ -1140,6 +1142,38 @@ def main():
                                 args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred,
                                 full_map_pred, agent[0].goal_id, visited_vis, full_target_edge_map,
                                 full_Frontiers_dict, goal_points=[], pre_goal_point=None)
+
+                        object_goal = None
+                        if grouper:
+                            goal_hint = getattr(agent[j], "goal_name", getattr(agent[0], "goal_name", None))
+                            try:
+                                object_goal = grouper.select_goal_object(
+                                    agent_position=start,
+                                    goal_hint=goal_hint,
+                                )
+                            except Exception as exc:
+                                logging.warning(
+                                    "Hierarchical goal selection failed for Agent_%d: %s",
+                                    j,
+                                    exc,
+                                )
+                                object_goal = None
+
+                        if object_goal and object_goal.get("det_id") in selected_goal_ids:
+                            object_goal = None
+
+                        if object_goal:
+                            selected_goal_ids.add(object_goal["det_id"])
+                            agent[j].is_Frontier = False
+                            goal_points[j] = object_goal["map_point"][:]
+                            logging.info(
+                                "Agent_%d assigned goal object det_id=%s category='%s' at map %s",
+                                j,
+                                object_goal["det_id"],
+                                object_goal["category"],
+                                object_goal["map_point"],
+                            )
+                            continue
 
                         if available_frontiers:
                             scored_frontiers = []

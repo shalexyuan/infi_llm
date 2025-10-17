@@ -1,10 +1,11 @@
 
 import logging
 import math
+import re
 import string
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Any
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Any, Set
 import numpy as np
 import pdb
 try:
@@ -136,6 +137,8 @@ class HierarchicalGrouper:
         self.next_gid = 0
         self.goal_text: Optional[str] = None
         self.goal_vector: Optional[np.ndarray] = None
+        self._unique_category_set: Set[str] = set()
+        self.unique_categories: List[str] = []
 
     # --- public API -----------------------------------------------------
     def reset(self) -> None:
@@ -147,6 +150,8 @@ class HierarchicalGrouper:
         self.det_labels.clear()
         self.next_gid = 0
         self.goal_vector = None
+        self._unique_category_set.clear()
+        self.unique_categories.clear()
 
     def set_goal_text(self, text: Optional[str]) -> None:
         self.goal_text = text
@@ -182,6 +187,7 @@ class HierarchicalGrouper:
             position = np.asarray(pos, dtype=np.float32)
             self.det_positions[det_id] = position
             self.det_labels[det_id] = label
+            self._register_category(label)
 
             if status == "new":
                 gid = self._assign_semantic_group(det_id, label)
@@ -232,7 +238,222 @@ class HierarchicalGrouper:
             summary.append(group_info)
         return summary
 
+    def get_unique_categories(self) -> List[str]:
+        """Return a copy of the detected unique semantic categories."""
+        return list(self.unique_categories)
+
+    def select_goal_object(
+        self,
+        agent_position: Sequence[float],
+        goal_hint: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Use the stored detections (and LLM when available) to select an object goal.
+
+        Args:
+            agent_position: Agent location in [row, col] grid coordinates.
+            goal_hint: Optional override for the desired goal text; defaults to self.goal_text.
+
+        Returns:
+            Dictionary with the selected object information or None when selection fails.
+        """
+        if not self.det_positions:
+            logging.debug("[HierGrouper] No detections available for goal selection.")
+            return None
+
+        categories = self.get_unique_categories()
+        if not categories:
+            logging.debug("[HierGrouper] No semantic categories recorded for goal selection.")
+            return None
+
+        hint = (goal_hint or self.goal_text or "").strip()
+        chosen_category = self._choose_category_with_llm(hint, categories)
+        if chosen_category is None:
+            chosen_category = self._fallback_category_selection(hint, categories)
+
+        if chosen_category is None:
+            logging.debug("[HierGrouper] Unable to determine a category for goal selection.")
+            return None
+
+        candidate_objects: List[Tuple[int, np.ndarray]] = []
+        for det_id, label in self.det_labels.items():
+            if label != chosen_category:
+                continue
+            det_pos = self.det_positions.get(det_id)
+            if det_pos is None or det_pos.size < 2 or not np.all(np.isfinite(det_pos[:2])):
+                continue
+            candidate_objects.append((det_id, det_pos))
+
+        if not candidate_objects:
+            logging.debug(
+                "[HierGrouper] No objects available for selected category '%s'.",
+                chosen_category,
+            )
+            return None
+
+        agent_xy = self._agent_position_to_xy(agent_position)
+        # If agent position is unavailable, fall back to the first candidate
+        if agent_xy is None or agent_xy.size < 2:
+            chosen_det_id, chosen_pos = candidate_objects[0]
+            distance = None
+        elif len(candidate_objects) == 1:
+            chosen_det_id, chosen_pos = candidate_objects[0]
+            distance = float(np.linalg.norm(chosen_pos[:2] - agent_xy))
+        else:
+            # Choose the nearest instance of the selected category
+            distances = [
+                (float(np.linalg.norm(det_pos[:2] - agent_xy)), det_id, det_pos)
+                for det_id, det_pos in candidate_objects
+            ]
+            distances.sort(key=lambda item: item[0])
+            distance, chosen_det_id, chosen_pos = distances[0]
+
+        map_y = int(round(float(chosen_pos[1])))
+        map_x = int(round(float(chosen_pos[0])))
+        goal_info = {
+            "det_id": chosen_det_id,
+            "category": chosen_category,
+            "position": {"x": map_x, "y": map_y},
+            "map_point": [map_y, map_x],
+        }
+        if distance is not None:
+            goal_info["distance"] = distance
+
+        logging.info(
+            "[HierGrouper] Selected goal object det_id=%s category='%s' at map (%d, %d).",
+            chosen_det_id,
+            chosen_category,
+            map_y,
+            map_x,
+        )
+        return goal_info
+
     # --- internal helpers -----------------------------------------------
+    def _register_category(self, label: Optional[str]) -> None:
+        if not label:
+            return
+        if label not in self._unique_category_set:
+            self._unique_category_set.add(label)
+            self.unique_categories.append(label)
+
+    def _refresh_unique_categories(self) -> None:
+        current = set(self.det_labels.values())
+        if current == self._unique_category_set:
+            return
+        self._unique_category_set = current
+        retained = [label for label in self.unique_categories if label in current]
+        if len(retained) != len(self.unique_categories):
+            self.unique_categories = retained
+        for label in current:
+            if label not in self.unique_categories:
+                self.unique_categories.append(label)
+
+    def _choose_category_with_llm(
+        self,
+        goal_hint: Optional[str],
+        categories: Sequence[str],
+    ) -> Optional[str]:
+        if self.llm_client is None or not categories:
+            return None
+        target_desc = goal_hint or self.goal_text or "target object"
+        options_text = "\n".join(f"- {cat}" for cat in categories)
+        prompt = (
+            "You are assisting a navigation robot searching for a goal item inside a building.\n"
+            f"Target description: {target_desc or 'unknown'}\n"
+            "Detected semantic categories that may contain relevant objects:\n"
+            f"{options_text}\n"
+            "Select the single category that is most likely to contain the target object. "
+            "Respond with exactly one category name from the list above."
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You help select the best semantic category to inspect for a target object. "
+                    "Always answer with exactly one category string from the provided list."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ]
+        try:
+            completion = self.llm_client.create_chat_completion(
+                "cogvlm2",
+                messages,
+                temperature=0.0,
+                max_tokens=32,
+                top_p=1.0,
+                use_stream=False,
+            )
+        except Exception as exc:
+            logging.warning("[HierGrouper] LLM category selection failed: %s", exc)
+            return None
+
+        if not completion:
+            return None
+
+        _, raw_response = completion
+        response = (raw_response or "").strip()
+        if not response:
+            return None
+
+        return self._parse_category_from_response(response, categories)
+
+    def _parse_category_from_response(
+        self,
+        response: str,
+        categories: Sequence[str],
+    ) -> Optional[str]:
+        normalized = response.strip().lower()
+        if not normalized:
+            return None
+
+        for category in categories:
+            if normalized == category.lower():
+                return category
+
+        for category in categories:
+            if category.lower() in normalized:
+                return category
+
+        tokens = [tok.strip() for tok in re.split(r"[\n,;:\\|]", normalized) if tok.strip()]
+        for token in tokens:
+            for category in categories:
+                if token == category.lower():
+                    return category
+
+        return None
+
+    def _fallback_category_selection(
+        self,
+        goal_hint: Optional[str],
+        categories: Sequence[str],
+    ) -> Optional[str]:
+        if not categories:
+            return None
+        if goal_hint:
+            hint_lower = goal_hint.lower()
+            for category in categories:
+                if category.lower() == hint_lower:
+                    return category
+            for category in categories:
+                if hint_lower in category.lower() or category.lower() in hint_lower:
+                    return category
+        return categories[0]
+
+    @staticmethod
+    def _agent_position_to_xy(agent_position: Sequence[float]) -> Optional[np.ndarray]:
+        if agent_position is None:
+            return None
+        try:
+            row = float(agent_position[0])
+            col = float(agent_position[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        return np.asarray([col, row], dtype=np.float32)
+
     def _ensure_encoder(self) -> Optional[Any]:
         if self.encoder is not None:
             return self.encoder
@@ -669,7 +890,9 @@ class HierarchicalGrouper:
         mapping = self.det_to_cluster.pop(det_id, None)
         gid = self.det_to_group.pop(det_id, None)
         self.det_positions.pop(det_id, None)
-        self.det_labels.pop(det_id, None)
+        removed_label = self.det_labels.pop(det_id, None)
+        if removed_label is not None:
+            self._refresh_unique_categories()
         vector = self.det_vectors.pop(det_id, None)
         if gid is None:
             return
