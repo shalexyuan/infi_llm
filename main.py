@@ -27,9 +27,9 @@ from PIL import Image
 
 import math
 import cv2
-import habitat
+import habitat  # pyright: ignore[reportMissingImports]
 import habitat_sim
-from habitat.sims.habitat_simulator.actions import (
+from habitat.sims.habitat_simulator.actions import (  # pyright: ignore[reportMissingImports]
     HabitatSimActions,
     HabitatSimV1ActionSpaceConfiguration,
 )
@@ -858,7 +858,7 @@ def main():
 
 
     map_manager = MapManager(args, device)
-    semantic_policy = getattr(args, "group_semantic_strategy", "clip")
+    semantic_policy = getattr(args, "group_semantic_strategy", "llm")
     semantic_threshold = getattr(args, "group_semantic_threshold", 0.81)
     spatial_threshold = getattr(args, "group_spatial_radius", 28.0)
     try:

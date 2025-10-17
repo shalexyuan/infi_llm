@@ -304,18 +304,18 @@ class HierarchicalGrouper:
 
             none_label = _letter_code(len(self.groups))
             option_map[none_label] = None
-            option_lines.append(f"{none_label}: None of the above (create a new group)")
+            option_lines.append(f"{none_label}: No other choice is better")
 
             prompt = (
-                "Which of the following groups does the incoming object best belong to?\n"
+                "Considering Indoor room layout and semantics, which of the following groups does the incoming object best belong to?\n"
                 + "\n".join(option_lines)
-                + f"\nIncoming object: {label}\nAnswer with a single letter."
+                + f"\nIncoming object: {label}\nAnswer with a single letter and nothing else."
             )
             try:
                 messages = [
                     {   
                             "role": "system",
-                            "content": "You are a knowledgeable assistant to answer multiple choice questions. Always answer with a single letter and nothing else.",
+                            "content": "You are a knowledgeable assistant to answer multiple choice questions by considering Indoor room layout. Always answer with a single letter and nothing else.",
                     },
                     {
                         "role": "user",
