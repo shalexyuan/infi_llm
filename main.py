@@ -772,9 +772,7 @@ def main():
         base_urls = ["http://127.0.0.1:31511"]
 
     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-    env_init_start = time.perf_counter()
     env = Multi_Agent_Env(config_env=config_env)
-    env_init_duration = time.perf_counter() - env_init_start
 
     num_episodes = env.number_of_episodes
 
@@ -784,12 +782,10 @@ def main():
 
     agent = []
     agent_GT = []
-    agent_init_start = time.perf_counter()
     for i in range(num_agents):
         agent.append(LLM_Agent(args, config_env, i, device))
         if 'objectnav_hm3d' in args.task_config:
             agent_GT.append(LLM_Agent_GT(args, config_env, i, device))
-    agent_init_duration = time.perf_counter() - agent_init_start
 
     # ------------------------------------------------------------------
     ##### Setup Logging
@@ -806,11 +802,6 @@ def main():
         filename=log_dir + 'output.log',
         level=logging.DEBUG)
     print("Dumping at {}".format(log_dir))
-    logging.info(
-        "Environment initialisation timings: env=%.3fs, agents=%.3fs",
-        env_init_duration,
-        agent_init_duration,
-    )
     # print(args)
     # logging.info(args)
     # ------------------------------------------------------------------
@@ -834,7 +825,6 @@ def main():
         "top_p": 1.0,
     }
 
-    handshake_start = time.perf_counter()
     reachable_urls = []
     for url in base_urls:
         endpoint = url.rstrip("/") + "/v1/chat/completions"
@@ -857,13 +847,6 @@ def main():
                 )
         except requests.RequestException as exc:
             logging.warning("CogVLM2 handshake raised for %s: %s", endpoint, exc)
-
-    handshake_duration = time.perf_counter() - handshake_start
-    logging.info(
-        "CogVLM2 handshake completed in %.3fs (%d endpoints)",
-        handshake_duration,
-        len(reachable_urls),
-    )
 
     if not reachable_urls:
         raise RuntimeError(f"No reachable CogVLM2 endpoints; attempted {base_urls}")
@@ -950,16 +933,10 @@ def main():
         for j in range(num_agents):
             goal_points.append([0, 0])
 
-        step_timing_totals: Dict[str, float] = defaultdict(float)
-        step_counter = 0
-
         while not env.episode_over:
-            step_counter += 1
-            current_step = agent[0].l_step
-            step_start = time.perf_counter()
-            mapping_start = step_start
-
+            
             Local_Policy = 0 # local policy
+            start = time.time()
             count_rotating = 0
             action = []
             
@@ -995,18 +972,12 @@ def main():
                 pose_pred.append(pos)
 
                     
-            mapping_end = time.perf_counter()
-            mapping_duration = mapping_end - mapping_start
             full_map2 = torch.cat([fm.unsqueeze(0) for fm in full_map], dim=0)
             # full_map2 = full_map[0].unsqueeze(0)
             # logging.info(f"full_map2: {full_map2.shape}") #[x,20,480,480]
 
             full_map_pred, _ = torch.max(full_map2, 0)
             Wall_list, full_Frontier_list, full_target_edge_map, full_target_point_map = Frontiers(full_map_pred)
-
-            frontier_end = time.perf_counter()
-            frontier_duration = frontier_end - mapping_end
-            analysis_start = frontier_end
 
             newly_detected_objects = []
             group_summary = []
@@ -1105,15 +1076,10 @@ def main():
                         map_manager.current_hierarchical_groups = compact_state
                     map_manager.clear_object_states()
 
-            analysis_end = time.perf_counter()
-            grouping_duration = analysis_end - analysis_start
-
             if agent[0].goal_id + 4 > 24:
                 break
 
-            goal_planning_duration = 0.0
             if agent[0].l_step % args.num_local_steps == args.num_local_steps - 1 or agent[0].l_step == 0:
-                goal_planning_start = time.perf_counter()
                 for j in range(num_agents):
                     agent[j].Perception_PR = 0
                 
@@ -1199,23 +1165,20 @@ def main():
                             actions = np.random.rand(1, 2).squeeze() * (full_target_edge_map.shape[0] - 1)
                             goal_points[j] = [int(actions[0]), int(actions[1])]
 
-                goal_planning_duration = time.perf_counter() - goal_planning_start
+                else:
+                    logging.info(f'===== No Frontier, Random Mode===== ')
+                    for j in range(num_agents):
+                        agent[j].is_Frontier = False
+                        rgb = observations[j]['rgb'].astype(np.uint8)
+                        start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[j].planner_pose_inputs
+                        r, c = start_y, start_x
+                        start = [int(r * 100.0 / args.map_resolution - gx1),
+                                int(c * 100.0 / args.map_resolution - gy1)]
+                        start = pu.threshold_poses(start, agent[j].local_map[0, :, :].cpu().numpy().shape)
+                        cur_goal_points.append(start)
 
-            else:
-                goal_planning_start = time.perf_counter()
-                logging.info(f'===== No Frontier, Random Mode===== ')
-                for j in range(num_agents):
-                    agent[j].is_Frontier = False
-                    start_x, start_y, start_o, gx1, gx2, gy1, gy2 = agent[j].planner_pose_inputs
-                    r, c = start_y, start_x
-                    start = [int(r * 100.0 / args.map_resolution - gx1),
-                            int(c * 100.0 / args.map_resolution - gy1)]
-                    start = pu.threshold_poses(start, agent[j].local_map[0, :, :].cpu().numpy().shape)
-                    cur_goal_points.append(start)
-
-                    actions = np.random.rand(1, 2).squeeze() * (full_target_edge_map.shape[0] - 1)
-                    goal_points[j] = [int(actions[0]), int(actions[1])]
-                goal_planning_duration = time.perf_counter() - goal_planning_start
+                        actions = np.random.rand(1, 2).squeeze() * (full_target_edge_map.shape[0] - 1)
+                        goal_points[j] = [int(actions[0]), int(actions[1])]
 
                 # ------------------------------------------------------------------
                 #### Logical Analysis
@@ -1243,7 +1206,6 @@ def main():
             
             
 
-            action_selection_start = time.perf_counter()
             for i in range(num_agents):
                 if len(target_point) > 0:
                     for j in range(num_agents):
@@ -1279,35 +1241,7 @@ def main():
                     start = pu.threshold_poses(start, agent[i].local_map[0, :, :].cpu().numpy().shape)
                     target_point = start.copy()
             # logging.info(f"actions: {action}")
-            action_selection_end = time.perf_counter()
-            action_selection_duration = action_selection_end - action_selection_start
-
-            env_step_start = time.perf_counter()
             observations = env.step(action)
-            env_step_end = time.perf_counter()
-            env_step_duration = env_step_end - env_step_start
-            step_end = env_step_end
-            step_duration = step_end - step_start
-
-            step_timing_totals['mapping'] += mapping_duration
-            step_timing_totals['frontier'] += frontier_duration
-            step_timing_totals['grouping'] += grouping_duration
-            step_timing_totals['goal'] += goal_planning_duration
-            step_timing_totals['action_select'] += action_selection_duration
-            step_timing_totals['env_step'] += env_step_duration
-            step_timing_totals['step'] += step_duration
-
-            logging.debug(
-                "Timing step %d: mapping=%.1fms frontier=%.1fms grouping=%.1fms goal=%.1fms action=%.1fms env=%.1fms total=%.1fms",
-                current_step,
-                mapping_duration * 1000.0,
-                frontier_duration * 1000.0,
-                grouping_duration * 1000.0,
-                goal_planning_duration * 1000.0,
-                action_selection_duration * 1000.0,
-                env_step_duration * 1000.0,
-                step_duration * 1000.0,
-            )
             
             # exit(0)
                     
@@ -1354,31 +1288,6 @@ def main():
             # logging.info(f"full_map_pred.shape: {full_map_pred.shape}") # [20,480,480] HM-3D
 
 ##############################################===Metrics===##############################################
-
-        if step_counter > 0:
-            logging.info(
-                "Episode %d timing summary: steps=%d mapping=%.3fs frontier=%.3fs grouping=%.3fs goal=%.3fs action=%.3fs env=%.3fs total=%.3fs",
-                count_episodes,
-                step_counter,
-                step_timing_totals.get('mapping', 0.0),
-                step_timing_totals.get('frontier', 0.0),
-                step_timing_totals.get('grouping', 0.0),
-                step_timing_totals.get('goal', 0.0),
-                step_timing_totals.get('action_select', 0.0),
-                step_timing_totals.get('env_step', 0.0),
-                step_timing_totals.get('step', 0.0),
-            )
-            logging.info(
-                "Episode %d average timings (ms): mapping=%.2f frontier=%.2f grouping=%.2f goal=%.2f action=%.2f env=%.2f total=%.2f",
-                count_episodes,
-                (step_timing_totals.get('mapping', 0.0) * 1000.0) / step_counter,
-                (step_timing_totals.get('frontier', 0.0) * 1000.0) / step_counter,
-                (step_timing_totals.get('grouping', 0.0) * 1000.0) / step_counter,
-                (step_timing_totals.get('goal', 0.0) * 1000.0) / step_counter,
-                (step_timing_totals.get('action_select', 0.0) * 1000.0) / step_counter,
-                (step_timing_totals.get('env_step', 0.0) * 1000.0) / step_counter,
-                (step_timing_totals.get('step', 0.0) * 1000.0) / step_counter,
-            )
 
         count_episodes += 1
         # obj_SR['num_'+agent[0].goal_name] += 1

@@ -2,7 +2,6 @@
 import logging
 import math
 import string
-import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Any
@@ -32,6 +31,8 @@ class SpatialCluster:
     member_ids: set = field(default_factory=set)
     member_positions: Dict[int, np.ndarray] = field(default_factory=dict)
     centroid: Optional[np.ndarray] = None
+    v_score: float = 0.0
+    h_score: float = 0.0
 
     def add_member(self, det_id: int, pos: np.ndarray) -> None:
         self.member_ids.add(det_id)
@@ -71,6 +72,8 @@ class SemanticGroup:
     clusters: Dict[int, SpatialCluster] = field(default_factory=dict)
     vector_sum: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.float32))
     next_cluster_id: int = 0
+    v_score: float = 0.0
+    h_score: float = 0.0
 
     def __post_init__(self):
         self.vector_sum = self.semantic_vector.copy()
@@ -113,6 +116,8 @@ class HierarchicalGrouper:
         self.semantic_threshold = semantic_threshold
         self.spatial_threshold = spatial_threshold
         self.llm_client = llm_client
+        self._clip_model_name = clip_model
+        self._clip_device = device
 
         self.encoder: Optional[Any] = None
         if self.semantic_policy == "clip":
@@ -146,18 +151,26 @@ class HierarchicalGrouper:
     def set_goal_text(self, text: Optional[str]) -> None:
         self.goal_text = text
         self.goal_vector = None
-        if text and self.encoder is not None:
-            vec = self.encoder.embed(text)
-            self.goal_vector = vec / (np.linalg.norm(vec) + 1e-9)
+        if text:
+            encoder = self._ensure_encoder()
+            if encoder is not None:
+                vec = encoder.embed(text)
+                self.goal_vector = vec / (np.linalg.norm(vec) + 1e-9)
+        if self.goal_vector is None:
+            for group in self.groups.values():
+                group.v_score = 0.0
+                group.h_score = 0.0
+                for cluster in group.clusters.values():
+                    cluster.v_score = 0.0
+                    cluster.h_score = 0.0
+        else:
+            self._update_all_group_scores()
 
     def add_detections(
         self,
         detections: Sequence[Dict[str, Any]],
         active_ids: Optional[Iterable[int]] = None,
     ) -> List[Dict[str, Any]]:
-        phase_start = time.perf_counter()
-        semantic_acc = 0.0
-        spatial_acc = 0.0
         summaries: List[Dict[str, Any]] = []
         for det in detections:
             det_id = det.get("det_id")
@@ -171,12 +184,8 @@ class HierarchicalGrouper:
             self.det_labels[det_id] = label
 
             if status == "new":
-                semantic_start = time.perf_counter()
                 gid = self._assign_semantic_group(det_id, label)
-                semantic_acc += time.perf_counter() - semantic_start
-                spatial_start = time.perf_counter()
                 cid = self._assign_spatial_group(det_id, gid, position)
-                spatial_acc += time.perf_counter() - spatial_start
                 summaries.append(
                     {
                         "det_id": det_id,
@@ -190,14 +199,7 @@ class HierarchicalGrouper:
 
         if active_ids is not None:
             self.prune_missing_detections(active_ids)
-        total_duration = time.perf_counter() - phase_start
-        logging.debug(
-            "[HierGrouper] add_detections timing: total=%.3f ms (semantic=%.3f ms, spatial=%.3f ms, detections=%d)",
-            total_duration * 1000.0,
-            semantic_acc * 1000.0,
-            spatial_acc * 1000.0,
-            len(detections),
-        )
+
         return summaries
 
     def prune_missing_detections(self, active_ids: Iterable[int]) -> None:
@@ -212,6 +214,8 @@ class HierarchicalGrouper:
             group_info = {
                 "semantic_group": gid,
                 "size": len(group.members),
+                "v_score": float(group.v_score),
+                "h_score": float(group.h_score),
                 "semantic_vector": group.semantic_vector.tolist(),
                 "clusters": [],
             }
@@ -220,6 +224,8 @@ class HierarchicalGrouper:
                     "cluster_id": cluster.cid,
                     "size": len(cluster.member_ids),
                     "centroid": cluster.centroid.tolist() if cluster.centroid is not None else None,
+                    "v_score": float(cluster.v_score),
+                    "h_score": float(cluster.h_score),
                     "members": list(cluster.member_ids),
                 }
                 group_info["clusters"].append(cluster_info)
@@ -227,24 +233,142 @@ class HierarchicalGrouper:
         return summary
 
     # --- internal helpers -----------------------------------------------
+    def _ensure_encoder(self) -> Optional[Any]:
+        if self.encoder is not None:
+            return self.encoder
+        if CLIPTextEncoder is None:
+            return None
+        try:
+            self.encoder = CLIPTextEncoder(self._clip_model_name, device=self._clip_device)
+        except Exception as exc:
+            logging.warning("[HierGrouper] CLIP encoder initialisation failed: %s", exc)
+            self.encoder = None
+        return self.encoder
+
+    def _maybe_embed_label(self, label: str) -> Optional[np.ndarray]:
+        encoder = self._ensure_encoder()
+        if encoder is None:
+            return None
+        try:
+            vec = encoder.embed(label)
+        except Exception as exc:
+            logging.warning("[HierGrouper] CLIP embedding failed for '%s': %s", label, exc)
+            return None
+        vec = vec / (np.linalg.norm(vec) + 1e-9)
+        return vec.astype(np.float32)
+
+    def _get_det_vector(self, det_id: int, label: str) -> Optional[np.ndarray]:
+        vec = self.det_vectors.get(det_id)
+        if vec is not None and np.isfinite(np.linalg.norm(vec)) and vec.ndim > 0:
+            return vec
+        vec = self._maybe_embed_label(label)
+        if vec is not None:
+            self.det_vectors[det_id] = vec
+        return vec
+
+    def _compute_cluster_centroid(self, cluster: SpatialCluster) -> Optional[np.ndarray]:
+        embeds = []
+        for det_id in cluster.member_ids:
+            label = self.det_labels.get(det_id, "")
+            emb = self._get_det_vector(det_id, label)
+            if emb is not None:
+                embeds.append(emb)
+        if not embeds:
+            return None
+        mu = np.mean(np.stack(embeds, axis=0), axis=0)
+        norm = float(np.linalg.norm(mu))
+        if not math.isfinite(norm) or norm < 1e-9:
+            return None
+        return mu / norm
+
+    def _update_group_scores(self, gid: int) -> None:
+        group = self.groups.get(gid)
+        if group is None:
+            return
+        if self.goal_vector is None or self.goal_vector.size == 0:
+            group.v_score = 0.0
+            group.h_score = 0.0
+            return
+
+        goal_vec = self.goal_vector
+        sem_vec = group.semantic_vector
+        if sem_vec is not None and sem_vec.size == goal_vec.size:
+            cos_sim = float(np.dot(sem_vec, goal_vec) / (np.linalg.norm(sem_vec) * (np.linalg.norm(goal_vec) + 1e-9)))
+            if math.isnan(cos_sim):
+                cos_sim = 0.0
+            group.v_score = (cos_sim + 1.0) * 0.5
+        else:
+            group.v_score = 0.0
+
+        dists = []
+        goal_norm = np.linalg.norm(goal_vec) + 1e-9
+        for det_id in group.members:
+            label = self.det_labels.get(det_id, "")
+            emb = self._get_det_vector(det_id, label)
+            if emb is None or emb.size != goal_vec.size:
+                continue
+            emb_norm = np.linalg.norm(emb) + 1e-9
+            cos_sim = float(np.dot(emb, goal_vec) / (emb_norm * goal_norm))
+            if math.isnan(cos_sim):
+                continue
+            dist = 1.0 - cos_sim
+            dist = max(0.0, min(2.0, dist))
+            dists.append(dist)
+        group.h_score = float(np.var(dists)) if dists else 0.0
+
+    def _update_cluster_scores(self, gid: int, cluster: SpatialCluster) -> None:
+        if self.goal_vector is None or self.goal_vector.size == 0:
+            cluster.v_score = 0.0
+            cluster.h_score = 0.0
+            return
+
+        goal_vec = self.goal_vector
+        centroid_vec = self._compute_cluster_centroid(cluster)
+        if centroid_vec is not None and centroid_vec.size == goal_vec.size:
+            cos_sim = float(np.dot(centroid_vec, goal_vec) / (np.linalg.norm(centroid_vec) * (np.linalg.norm(goal_vec) + 1e-9)))
+            if math.isnan(cos_sim):
+                cos_sim = 0.0
+            cluster.v_score = (cos_sim + 1.0) * 0.5
+        else:
+            cluster.v_score = 0.0
+
+        dists = []
+        goal_norm = np.linalg.norm(goal_vec) + 1e-9
+        for det_id in cluster.member_ids:
+            label = self.det_labels.get(det_id, "")
+            emb = self._get_det_vector(det_id, label)
+            if emb is None or emb.size != goal_vec.size:
+                continue
+            emb_norm = np.linalg.norm(emb) + 1e-9
+            cos_sim = float(np.dot(emb, goal_vec) / (emb_norm * goal_norm))
+            if math.isnan(cos_sim):
+                continue
+            dist = 1.0 - cos_sim
+            dist = max(0.0, min(2.0, dist))
+            dists.append(dist)
+        cluster.h_score = float(np.var(dists)) if dists else 0.0
+
+    def _update_all_group_scores(self) -> None:
+        for gid, group in self.groups.items():
+            self._update_group_scores(gid)
+            for cluster in group.clusters.values():
+                self._update_cluster_scores(gid, cluster)
+
     def _embed(self, label: str) -> np.ndarray:
-        if self.encoder is None:
+        encoder = self._ensure_encoder()
+        if encoder is None:
             raise RuntimeError("CLIP encoder not initialised for clip-based grouping.")
-        vec = self.encoder.embed(label)
+        vec = encoder.embed(label)
         vec = vec / (np.linalg.norm(vec) + 1e-9)
         return vec.astype(np.float32)
 
     def _assign_semantic_group(self, det_id: int, label: str) -> int:
         if self.semantic_policy == "clip":
-            total_start = time.perf_counter()
-            embed_start = time.perf_counter()
             vector = self._embed(label)
-            embed_time = time.perf_counter() - embed_start
             self.det_vectors[det_id] = vector
             best_gid = None
             best_sim = -1.0
             similarity_rows = []
-            sim_start = time.perf_counter()
             for gid, group in self.groups.items():
                 sim = _cosine(vector, group.semantic_vector)
                 members = []
@@ -256,7 +380,6 @@ class HierarchicalGrouper:
                 if sim > best_sim:
                     best_sim = sim
                     best_gid = gid
-            sim_time = time.perf_counter() - sim_start
             if similarity_rows:
                 header = f"Incoming det_id={det_id} label={label}"
                 table_lines = [header, "gid | cosine_similarity | members(label@position)", "----|-------------------|--------------------------"]
@@ -273,16 +396,6 @@ class HierarchicalGrouper:
             goal_bonus = 0.0
             if self.goal_vector is not None:
                 goal_bonus = _cosine(vector, self.goal_vector)
-
-            def _log_clip_timing(context: str) -> None:
-                total_elapsed = time.perf_counter() - total_start
-                logging.debug(
-                    "[HierGrouper] timing semantic clip (%s): total=%.3f ms (embed=%.3f ms, similarity=%.3f ms)",
-                    context,
-                    total_elapsed * 1000.0,
-                    embed_time * 1000.0,
-                    sim_time * 1000.0,
-                )
             if best_gid is not None and best_sim >= self.semantic_threshold:
                 group = self.groups[best_gid]
                 group.add_member(det_id, vector)
@@ -295,7 +408,7 @@ class HierarchicalGrouper:
                     best_sim,
                     goal_bonus,
                 )
-                _log_clip_timing("reuse")
+                self._update_group_scores(best_gid)
                 return best_gid
 
             gid = self._create_semantic_group(vector)
@@ -307,11 +420,10 @@ class HierarchicalGrouper:
                 label,
                 gid,
             )
-            _log_clip_timing("new_group")
+            self._update_group_scores(gid)
             return gid
 
         if self.semantic_policy == "llm" and self.llm_client is not None:
-            total_start = time.perf_counter()
             option_map: Dict[str, int] = {}
 
             def _letter_code(index: int) -> str:
@@ -340,27 +452,21 @@ class HierarchicalGrouper:
             option_lines.append(f"{none_label}: None of the above (create a new group)")
 
             prompt = (
-                f"Considering Indoor room layout and semantics, which of the following groups does the {label} best belong to?\n"
+                "Considering Indoor room layout and semantics, which of the following groups does the incoming object best belong to?\n"
                 + "\n".join(option_lines)
-                + "\nAnswer with a single letter and nothing else."
+                + f"\nIncoming object: {label}\nAnswer with a single letter and nothing else."
             )
-            logging.debug("[HierGrouper] LLM prompt:\n%s", prompt)
-            messages = [
-                {   
-                        "role": "system",
-                        "content": "You are a knowledgeable assistant to answer multiple choice questions by considering Indoor room layout. Always answer with a single letter and nothing else.",
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ]
-            prepare_time = time.perf_counter() - total_start
-            llm_call_time = 0.0
-            parse_time = 0.0
-            fallback_reason: Optional[str] = None
             try:
-                llm_call_start = time.perf_counter()
+                messages = [
+                    {   
+                            "role": "system",
+                            "content": "You are a knowledgeable assistant to answer multiple choice questions by considering Indoor room layout. Always answer with a single letter and nothing else.",
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ]
                 completion = self.llm_client.create_chat_completion(
                     "cogvlm2",
                     messages,
@@ -369,17 +475,13 @@ class HierarchicalGrouper:
                     top_p=1.0,
                     use_stream=False,
                 )
-                llm_call_time = time.perf_counter() - llm_call_start
                 if not completion:
                     raise ValueError("Empty LLM response")
                 _, raw_response = completion
-                parse_start = time.perf_counter()
                 response = (raw_response or "").strip()
-                logging.debug("[HierGrouper] LLM raw response: %s", raw_response)
                 if not response:
                     raise ValueError("Blank LLM response content")
                 token = response.split()[0].upper().rstrip(".,:;")
-                parse_time = time.perf_counter() - parse_start
 
                 if token in option_map:
                     mapped_gid = option_map[token]
@@ -400,14 +502,7 @@ class HierarchicalGrouper:
                             gid,
                             token,
                         )
-                        total_elapsed = time.perf_counter() - total_start
-                        logging.debug(
-                            "[HierGrouper] timing semantic llm (new_group): total=%.3f ms (prepare=%.3f ms, llm=%.3f ms, parse=%.3f ms)",
-                            total_elapsed * 1000.0,
-                            prepare_time * 1000.0,
-                            llm_call_time * 1000.0,
-                            parse_time * 1000.0,
-                        )
+                        self._update_group_scores(gid)
                         return gid
 
                     gid = mapped_gid
@@ -426,23 +521,7 @@ class HierarchicalGrouper:
                         gid,
                         token,
                     )
-                    total_elapsed = time.perf_counter() - total_start
-                    logging.debug(
-                        "[HierGrouper] timing semantic llm (reuse): total=%.3f ms (prepare=%.3f ms, llm=%.3f ms, parse=%.3f ms)",
-                        total_elapsed * 1000.0,
-                        prepare_time * 1000.0,
-                        llm_call_time * 1000.0,
-                        parse_time * 1000.0,
-                    )
-                    fallback_reason = "unexpected_token"
-                    total_elapsed = time.perf_counter() - total_start
-                    logging.debug(
-                        "[HierGrouper] timing semantic llm (unexpected token): total=%.3f ms (prepare=%.3f ms, llm=%.3f ms, parse=%.3f ms)",
-                        total_elapsed * 1000.0,
-                        prepare_time * 1000.0,
-                        llm_call_time * 1000.0,
-                        parse_time * 1000.0,
-                    )
+                    self._update_group_scores(gid)
                     return gid
                 else:
                     logging.warning(
@@ -452,15 +531,6 @@ class HierarchicalGrouper:
                         label,
                     )
             except Exception as exc:
-                fallback_reason = "exception"
-                total_elapsed = time.perf_counter() - total_start
-                logging.debug(
-                    "[HierGrouper] timing semantic llm (error): total=%.3f ms (prepare=%.3f ms, llm=%.3f ms, parse=%.3f ms)",
-                    total_elapsed * 1000.0,
-                    prepare_time * 1000.0,
-                    llm_call_time * 1000.0,
-                    parse_time * 1000.0,
-                )
                 logging.warning("LLM grouping fallback due to error: %s", exc)
             vector = np.zeros(1, dtype=np.float32)
             gid = self._create_semantic_group(vector)
@@ -473,15 +543,7 @@ class HierarchicalGrouper:
                 label,
                 gid,
             )
-            total_elapsed = time.perf_counter() - total_start
-            logging.debug(
-                "[HierGrouper] timing semantic llm (fallback_new_group%s): total=%.3f ms (prepare=%.3f ms, llm=%.3f ms, parse=%.3f ms)",
-                "" if fallback_reason is None else f"_{fallback_reason}",
-                total_elapsed * 1000.0,
-                prepare_time * 1000.0,
-                llm_call_time * 1000.0,
-                parse_time * 1000.0,
-            )
+            self._update_group_scores(gid)
             return gid
 
         # default fallback: create separate group
@@ -510,12 +572,10 @@ class HierarchicalGrouper:
         return gid
 
     def _assign_spatial_group(self, det_id: int, gid: int, position: np.ndarray) -> int:
-        total_start = time.perf_counter()
         group = self.groups[gid]
         best_cluster: Optional[SpatialCluster] = None
         best_distance = float("inf")
         distance_rows = []
-        search_start = time.perf_counter()
         for cluster in group.clusters.values():
             distance = cluster.closest_distance(position)
             member_strs = []
@@ -554,25 +614,17 @@ class HierarchicalGrouper:
                 )
             logging.debug("[HierGrouper] spatial distance table\n%s", "\n".join(table_lines))
 
-        distance_time = time.perf_counter() - search_start
-        assign_start = time.perf_counter()
         if best_cluster is not None and best_distance <= self.spatial_threshold:
             best_cluster.add_member(det_id, position)
             self.det_to_cluster[det_id] = (gid, best_cluster.cid)
-            assign_time = time.perf_counter() - assign_start
-            total_elapsed = time.perf_counter() - total_start
+            self._update_cluster_scores(gid, best_cluster)
+            self._update_group_scores(gid)
             logging.debug(
                 "[HierGrouper] det_id=%s assigned to spatial cluster %d (gid=%d, dist=%.3f)",
                 det_id,
                 best_cluster.cid,
                 gid,
                 best_distance,
-            )
-            logging.debug(
-                "[HierGrouper] timing spatial (reuse): total=%.3f ms (search=%.3f ms, assign=%.3f ms)",
-                total_elapsed * 1000.0,
-                distance_time * 1000.0,
-                assign_time * 1000.0,
             )
             return best_cluster.cid
 
@@ -582,19 +634,13 @@ class HierarchicalGrouper:
         new_cluster.add_member(det_id, position)
         group.clusters[cid] = new_cluster
         self.det_to_cluster[det_id] = (gid, cid)
-        assign_time = time.perf_counter() - assign_start
-        total_elapsed = time.perf_counter() - total_start
+        self._update_cluster_scores(gid, new_cluster)
+        self._update_group_scores(gid)
         logging.debug(
             "[HierGrouper] det_id=%s created spatial cluster %d (gid=%d)",
             det_id,
             cid,
             gid,
-        )
-        logging.debug(
-            "[HierGrouper] timing spatial (new_cluster): total=%.3f ms (search=%.3f ms, assign=%.3f ms)",
-            total_elapsed * 1000.0,
-            distance_time * 1000.0,
-            assign_time * 1000.0,
         )
         return cid
 
@@ -611,6 +657,7 @@ class HierarchicalGrouper:
         if cluster is None:
             return
         cluster.update_member(det_id, position)
+        self._update_cluster_scores(gid, cluster)
         logging.debug(
             "[HierGrouper] det_id=%s updated position in spatial cluster %d (gid=%d)",
             det_id,
@@ -642,9 +689,13 @@ class HierarchicalGrouper:
                         cid,
                         gid,
                     )
+                else:
+                    self._update_cluster_scores(gid, cluster)
         if not group.members:
             self.groups.pop(gid, None)
             logging.debug("[HierGrouper] removed empty semantic group %d", gid)
+        else:
+            self._update_group_scores(gid)
 
     def _label_for_detection(self, det_id: int) -> Optional[str]:
         # Returning None keeps prompt clean when label unknown
