@@ -1033,11 +1033,7 @@ def main():
                         )
 
                     active_ids = {int(obj_id) for obj_id in tracked_objects.keys()}
-                    logging.debug(
-                        "Active detection ids (step %d): %s",
-                        agent[0].l_step,
-                        sorted(active_ids),
-                    )
+
                     assignment_summary = grouper.add_detections(det_payload, active_ids=active_ids)
                     groups_state = grouper.get_groups_summary()
                     if assignment_summary:
