@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import torch
 from skimage import measure
@@ -319,6 +320,12 @@ class MapManager:
             'step': latest_step,
             'merged_from': connected_objects + ['new_component']  # Track which objects were merged
         }
+        logging.info(
+            "MapManager: merged objects %s with new component -> category=%s position=%s",
+            connected_objects,
+            info.get('category'),
+            info.get('map_position'),
+        )
         return self._ensure_position(info)
 
     def components_overlap(self, comp1, comp2):
@@ -541,6 +548,13 @@ class MapManager:
         self.next_object_id += 1
         object_info['object_id'] = object_id
         self.tracked_objects[object_id] = self._ensure_position(object_info)
+        logging.info(
+            "MapManager: activated new object_id=%d category=%s position=%s step=%s",
+            object_id,
+            object_info.get('category'),
+            object_info.get('map_position'),
+            object_info.get('step'),
+        )
         return object_id
 
     def _create_new_object(self, object_info):

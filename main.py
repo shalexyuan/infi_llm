@@ -6,6 +6,7 @@ import logging
 import time
 import json
 import sys
+import requests
 import gym
 import matplotlib.pyplot as plt
 import torch.nn as nn
@@ -19,7 +20,7 @@ import quaternion
 import pickle
 import io
 import re
-
+import pdb
 from skimage import measure
 import skimage.morphology
 from PIL import Image
@@ -49,6 +50,9 @@ import utils.pose as pu
 import utils.visualization as vu
 
 from arguments import get_args
+from aide_tests.map_manager import MapManager
+from aide_tests.hierarchical_grouper import HierarchicalGrouper
+from src.vlm import CogVLM2
 
 
 @habitat.registry.register_action_space_configuration
@@ -716,6 +720,7 @@ def calculate_distance(coord1, coord2):
     return math.sqrt((coord1[0] - coord2[0]) ** 2 + (coord1[1] - coord2[1]) ** 2)
 
 def main():
+    
     args = get_args()
 
     np.random.seed(args.seed)
@@ -761,9 +766,12 @@ def main():
     config_env.SIMULATOR.ACTION_SPACE_CONFIG = "PreciseTurn"
     config_env.freeze()
 
-    print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+    base_url_raw = getattr(args, "base_url", "")
+    base_urls = [url.strip() for url in str(base_url_raw).split(",") if url.strip()]
+    if not base_urls:
+        base_urls = ["http://127.0.0.1:31511"]
 
-    
+    print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
     env = Multi_Agent_Env(config_env=config_env)
 
     num_episodes = env.number_of_episodes
@@ -792,11 +800,79 @@ def main():
 
     logging.basicConfig(
         filename=log_dir + 'output.log',
-        level=logging.INFO)
+        level=logging.DEBUG)
     print("Dumping at {}".format(log_dir))
     # print(args)
     # logging.info(args)
     # ------------------------------------------------------------------
+
+
+
+    model_id = getattr(args, "vlm_model_id", "cogvlm2")
+    test_payload = {
+        "model": model_id,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "ping"},
+                ],
+            }
+        ],
+        "stream": False,
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "top_p": 1.0,
+    }
+
+    reachable_urls = []
+    for url in base_urls:
+        endpoint = url.rstrip("/") + "/v1/chat/completions"
+        try:
+            response = requests.post(endpoint, json=test_payload, timeout=4.0)
+            if response.status_code == 200:
+                reachable_urls.append(url)
+                logging.info(
+                    "CogVLM2 handshake succeeded at %s (status %s)",
+                    endpoint,
+                    response.status_code,
+                )
+            else:
+                body_preview = response.text[:200].replace("\n", " ")
+                logging.warning(
+                    "CogVLM2 handshake failed for %s (status %s, body %s)",
+                    endpoint,
+                    response.status_code,
+                    body_preview,
+                )
+        except requests.RequestException as exc:
+            logging.warning("CogVLM2 handshake raised for %s: %s", endpoint, exc)
+
+    if not reachable_urls:
+        raise RuntimeError(f"No reachable CogVLM2 endpoints; attempted {base_urls}")
+
+    cogvlm_clients = [CogVLM2(url) for url in reachable_urls]
+    args.base_url = reachable_urls[0]
+    args.cogvlm_clients = cogvlm_clients
+
+
+
+    map_manager = MapManager(args, device)
+    semantic_policy = getattr(args, "group_semantic_strategy", "clip")
+    semantic_threshold = getattr(args, "group_semantic_threshold", 0.81)
+    spatial_threshold = getattr(args, "group_spatial_radius", 28.0)
+    try:
+        llm_client = cogvlm_clients[0] if semantic_policy == "llm" and cogvlm_clients else None
+        grouper = HierarchicalGrouper(
+            semantic_policy=semantic_policy,
+            semantic_threshold=semantic_threshold,
+            spatial_threshold=spatial_threshold,
+            llm_client=llm_client,
+        )
+    except RuntimeError as exc:
+        logging.warning("Hierarchical grouper disabled: %s", exc)
+        grouper = None
+
 
     # print("num_episodes:",num_episodes)# 1000
 
@@ -845,6 +921,11 @@ def main():
             if 'objectnav_hm3d' in args.task_config:
                 agent_GT[i].reset()
         
+        if map_manager:
+            map_manager.reset_tracking()
+        if grouper:
+            grouper.reset()
+    
         pre_g_points.clear()
         target_point.clear()
 
@@ -898,6 +979,107 @@ def main():
             full_map_pred, _ = torch.max(full_map2, 0)
             Wall_list, full_Frontier_list, full_target_edge_map, full_target_point_map = Frontiers(full_map_pred)
 
+            newly_detected_objects = []
+            group_summary = []
+            if map_manager:
+                map_manager.update_step(agent[0].l_step)
+                numpy_full_map = full_map_pred.detach().cpu().numpy()
+                object_positions = map_manager.get_object_positions(
+                    numpy_full_map,
+                    agent[0].object_category,
+                )
+                newly_detected_objects = map_manager.get_newly_added_objects(object_positions)
+                map_manager.latest_object_positions = object_positions
+                map_manager.latest_new_objects = newly_detected_objects
+                logging.info(
+                    "Map manager objects: total=%d, new=%d at step=%d",
+                    len(object_positions),
+                    len(newly_detected_objects),
+                    agent[0].l_step,
+                )
+                if newly_detected_objects:
+                    logging.info(
+                        "Newly detected objects (step %d): %s",
+                        agent[0].l_step,
+                        [
+                            {
+                                "object_id": obj.get("object_id"),
+                                "category": obj.get("category"),
+                                "position": obj.get("map_position"),
+                            }
+                            for obj in newly_detected_objects
+                        ],
+                    )
+                if grouper:
+                    grouper.set_goal_text(getattr(agent[0], "goal_name", None))
+                tracked_objects = getattr(map_manager, "tracked_objects", {}) if map_manager else {}
+                if grouper and tracked_objects is not None:
+                    det_payload = []
+                    for obj in newly_detected_objects:
+                        obj_id = obj.get("object_id")
+                        category = obj.get("category")
+                        mp = obj.get("map_position") or {}
+                        if obj_id is None or category is None:
+                            continue
+                        if "x" not in mp or "y" not in mp:
+                            continue
+                        det_payload.append(
+                            {
+                                "det_id": int(obj_id),
+                                "label": category,
+                                "xy": (float(mp["x"]), float(mp["y"])),
+                                "status": obj.get("object_state", "new"),
+                            }
+                        )
+
+                    active_ids = {int(obj_id) for obj_id in tracked_objects.keys()}
+                    logging.debug(
+                        "Active detection ids (step %d): %s",
+                        agent[0].l_step,
+                        sorted(active_ids),
+                    )
+                    assignment_summary = grouper.add_detections(det_payload, active_ids=active_ids)
+                    groups_state = grouper.get_groups_summary()
+                    if assignment_summary:
+                        compact_assignments = [
+                            {
+                                "det_id": entry.get("det_id"),
+                                "semantic_group": entry.get("semantic_group"),
+                                "spatial_cluster": entry.get("spatial_cluster"),
+                                "category": entry.get("category"),
+                            }
+                            for entry in assignment_summary
+                        ]
+                        logging.info(
+                            "Hierarchical grouping assignments (step %d): %s",
+                            agent[0].l_step,
+                            compact_assignments,
+                        )
+                    if groups_state:
+                        compact_state = []
+                        for group in groups_state:
+                            group_entry = {
+                                "semantic_group": group.get("semantic_group"),
+                                "size": group.get("size"),
+                                "clusters": [],
+                            }
+                            for cluster in group.get("clusters", []):
+                                group_entry["clusters"].append(
+                                    {
+                                        "cluster_id": cluster.get("cluster_id"),
+                                        "size": cluster.get("size"),
+                                        "centroid": cluster.get("centroid"),
+                                    }
+                                )
+                            compact_state.append(group_entry)
+                        logging.info(
+                            "Hierarchical grouping state (step %d): %s",
+                            agent[0].l_step,
+                            compact_state,
+                        )
+                        map_manager.current_hierarchical_groups = compact_state
+                    map_manager.clear_object_states()
+
             if agent[0].goal_id + 4 > 24:
                 break
 
@@ -915,21 +1097,6 @@ def main():
 
 
                 if len(full_target_point_map) > 0:
-                    initial_positions = None
-                    if agent[0].l_step == 0:
-                        map_dim = full_target_edge_map.shape[0]
-                        offset = max(1, map_dim // 4)
-                        center = map_dim // 2
-                        pos_a = [
-                            max(0, min(map_dim - 1, center - offset)),
-                            max(0, min(map_dim - 1, center - offset)),
-                        ]
-                        pos_b = [
-                            max(0, min(map_dim - 1, center + offset)),
-                            max(0, min(map_dim - 1, center + offset)),
-                        ]
-                        initial_positions = [pos_a, pos_b]
-
                     full_Frontiers_dict = {}
                     for j in range(len(full_target_point_map)):
                         full_Frontiers_dict['frontier_' + str(j)] = f"<centroid: {full_target_point_map[j][0], full_target_point_map[j][1]}, number: {full_Frontier_list[j]}>"
@@ -966,12 +1133,6 @@ def main():
                                 int(c * 100.0 / args.map_resolution - gy1)]
                         start = pu.threshold_poses(start, agent[j].local_map[0, :, :].cpu().numpy().shape)
                         cur_goal_points.append(start)
-
-                        if initial_positions is not None:
-                            chosen = initial_positions[j] if j < len(initial_positions) else initial_positions[-1]
-                            goal_points[j] = chosen.copy()
-                            logging.info(f"Initial spread assignment for Agent_{j}: {goal_points[j]}")
-                            continue
 
                         if len(pre_goal_points) > 0:
                             sem_map, sem_map_frontier = Decision_Generation_Vis(
@@ -1044,7 +1205,6 @@ def main():
 
                 # logging.info(f"pre_g_points: {pre_g_points}")        
                 
-                logging.info(f"goal_points: {goal_points}")
                 pre_g_points = goal_points.copy()
                 logging.info("===== Starting local strategy ===== ")
             
@@ -1054,6 +1214,26 @@ def main():
                 if len(target_point) > 0:
                     for j in range(num_agents):
                         goal_points[j] = target_point
+                    
+                if agent[0].l_step == 0:
+                    map_dim = full_target_edge_map.shape[0]
+                    offset = max(1, map_dim // 4)
+                    center = map_dim // 2
+                    initial_spread_positions = [
+                        [
+                            max(0, min(map_dim - 1, center - offset)),
+                            max(0, min(map_dim - 1, center + offset)),
+                        ],
+                        [
+                            max(0, min(map_dim - 1, center + offset)),
+                            max(0, min(map_dim - 1, center - offset)),
+                        ],
+                    ]
+                    for j in range(num_agents):
+                        chosen = initial_spread_positions[j] if j < len(initial_spread_positions) else initial_spread_positions[-1]
+                        goal_points[j] = chosen.copy()
+
+                    logging.info(f"===========> Initial spread goals: {goal_points}")
                 action[i] = agent[i].act(goal_points[i])
                 if 'objectnav_hm3d' in args.task_config:
                     _ = agent_GT[i].act(goal_points[i])
