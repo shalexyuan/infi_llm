@@ -1478,6 +1478,41 @@ def main():
                 f.write(log)
                 f.write('\n')
         # ------------------------------------------------------------------
+        
+    # Define a simple last prompt for keepalive
+    last_prompt = "what is 1+2? only give the answer, no other words."
+    last_messages = [
+        {
+            "role": "system",
+            "content": "You help robots choose navigation targets. Always reply with a single integer object_id and nothing else.",
+        },
+        {
+            "role": "user",
+            "content": last_prompt,
+        },
+    ]
+    
+    logging.info("="*50)
+    logging.info("Starting LLM server keepalive (10 second intervals)")
+    logging.info("="*50)
+    
+
+    while True:
+        # time.sleep(random.uniform(5, 10))
+        time.sleep(10)
+        for idx, llm_client in enumerate(cogvlm_clients):
+            try:
+                _, response = llm_client.create_chat_completion(
+                    "cogvlm2",
+                    messages=last_messages,
+                    temperature=0.2,
+                    top_p=0.9,
+                    max_tokens=256,
+                    use_stream=False,
+                )
+                logging.info(f"[Keepalive] LLM client {idx} responded: {response[:50] if response else 'None'}")
+            except Exception as exc:
+                logging.warning(f"[Keepalive] LLM client {idx} failed: {exc}")
 
 
     # avg_metrics = {k: v / count_episodes for k, v in agg_metrics.items()}
